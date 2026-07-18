@@ -17,8 +17,8 @@ local raknet = require('samp.raknet')
 local wm = require('windows.message')
 local new = imgui.new
 
---local UPDATE_CHECK_URL = nil
-local UPDATE_CHECK_URL = nil
+--local UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Bounteiro/mining-tools/main/version.json"
+local UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Bounteiro/mining-tools/main/version.json"
 
 local searchBuffer = new.char[256]()
 local currentStatusFilter = new.int(0)
@@ -299,7 +299,7 @@ local function getDefaultCfg()
         active                   = true,
         debug                    = false,
         silentMode               = false,
-        checkForUpdates          = false,
+        checkForUpdates          = true,
         useDialogMode            = false,
         helpShown                = false,
 
@@ -803,8 +803,26 @@ local updateState = {
     showPopup     = imgui.new.bool(false),
     declined      = false,
     checking      = false,
+    postponeUntil = 0,
+    forceShowPopup = false,
+    shownFlash    = false,
+    flashOpenAsked = false,
 }
 
+
+function updatePopupShouldShow()
+    if not updateState.hasUpdate then return false end
+    if updateState.declined then return false end
+    if (updateState.postponeUntil or 0) > os.time() then return false end
+    return true
+end
+
+function updatePopupOpen(force)
+    if not force and not updatePopupShouldShow() then return false end
+    if not updateState.hasUpdate then return false end
+    updateState.showPopup[0] = true
+    return true
+end
 function downloadAndUpdate()
     if not updateState.updateUrl then return end
     utils.addChat("{FFE133}Загружаю обновление...")
@@ -823,20 +841,14 @@ function downloadAndUpdate()
                 file:close()
                 wait(50)
 
-                if sameFile then
-                    thisScript():reload()
-                else
-                    script.load(newPath)
+                -- Always write then single reload of THIS script to avoid double load/welcome
+                if not sameFile then
+                    -- keep one script: unload others with same name after reload target exists
                     wait(50)
-                    for _, s in pairs(script.list()) do
-                        if s.path == oldPath then
-                            s:unload()
-                            break
-                        end
-                    end
-                    wait(50)
-                    os.remove(oldPath)
                 end
+                utils.addChat("{BEF781}Update saved. Reloading...")
+                wait(100)
+                thisScript():reload()
             else
                 utils.addChat("{F78181}Не удалось сохранить файл обновления.")
             end
@@ -854,7 +866,8 @@ function checkForUpdates()
     updateState.checking = true
     utils.debugChat("[UPDATE] Проверяю обновления...")
 
-    asyncHttpRequest("GET", UPDATE_CHECK_URL, {}, function(resp)
+    local checkUrl = UPDATE_CHECK_URL .. ((UPDATE_CHECK_URL:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.time()))
+    asyncHttpRequest("GET", checkUrl, { headers = { ['User-Agent'] = 'MiningTools-MoonLoader', ['Cache-Control'] = 'no-cache' } }, function(resp)
         updateState.checking = false
         if resp.status_code == 200 or resp.status_code == 304 then
             local json     = require('dkjson')
@@ -866,6 +879,12 @@ function checkForUpdates()
                     updateState.updateUrl     = info.updateurl
                     updateState.changelog     = u8:decode(info.changelog or "")
                     updateState.showPopup[0]  = false
+                    updateState.declined     = false
+                    if updateState.forceShowPopup then
+                        updateState.showPopup[0] = true
+                        updateState.forceShowPopup = false
+                    end
+                    -- Popup opens only when player opens /flashminer (not on server join)
                     utils.debugChat("[UPDATE] Доступна версия: " .. info.latest)
                 else
                     utils.debugChat("[UPDATE] Версия актуальна (" .. info.latest .. ")")
@@ -3123,7 +3142,20 @@ function main()
         save()
     end)
 
-    sampRegisterChatCommand('fls', function()
+        sampRegisterChatCommand('mntu', function()
+        updateState.declined = false
+        updateState.hasUpdate = false
+        updateState.checking = false
+        updateState.forceShowPopup = true
+        updateState.postponeUntil = 0
+        checkForUpdates()
+    end)
+    sampRegisterChatCommand('mntver', function()
+        utils.addChat("{808080}version={FFFFFF}" .. tostring(script.this.version) .. "{808080} check={FFFFFF}" .. tostring(cfg.checkForUpdates))
+        utils.addChat("{808080}url={FFFFFF}" .. tostring(UPDATE_CHECK_URL))
+        utils.addChat("{808080}hasUpdate={FFFFFF}" .. tostring(updateState.hasUpdate) .. " latest={FFFFFF}" .. tostring(updateState.latestVersion))
+    end)
+sampRegisterChatCommand('fls', function()
         if data.hasFlashminer == false then
             utils.addChat("{F78181}У вас нет флешки майнера.")
             return
@@ -3167,7 +3199,9 @@ function main()
             cond = function() return updateState.showPopup[0] end,
             act = function()
                 updateState.showPopup[0] = false
-                updateState.declined = true
+                updateState.postponeUntil = os.time() + 30 * 60
+                updateState.flashOpenAsked = false
+                updateState.declined = false
             end
         },
         {
@@ -3319,6 +3353,7 @@ function main()
                 if selectedHouse then
                     sampSendDialogResponse(data.dFlashminerId, 1, selectedHouse.index - 1, "")
                     data.showHouseControlWindow[0] = false
+        updateState.flashOpenAsked = false
                     data.lastSelectedHouse = selectedHouse.house_number
                 end
             end
@@ -3630,8 +3665,9 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
             if not data.silentWindowOpen then
                 data.showHouseControlWindow[0] = true
             end
-            if not data.silentWindowOpen and updateState.hasUpdate and not updateState.declined then
-                updateState.showPopup[0] = true
+            if not data.silentWindowOpen then
+                -- Show update overlay on first flashminer open (and later if not postponed)
+                updatePopupOpen(false)
             end
             if not wasWindowAlreadyVisible then
                 local foundIndex = 1
@@ -6966,7 +7002,10 @@ imgui.OnFrame(
             imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.13, 0.13, 0.16, 1))
             if imgui.Button(fa.CLOCK .. u8 "  Напомнить позже", imgui.ImVec2(halfW, 36)) then
                 updateState.showPopup[0] = false
-                updateState.declined     = true
+                updateState.postponeUntil = os.time() + 30 * 60
+                updateState.flashOpenAsked = false
+                updateState.declined     = false
+                utils.addChat("{808080}Обновление отложено на 30 минут.")
             end
             imgui.PopStyleColor(3)
             imgui.Hint("Закрыть окно. Обновление можно будет установить позже из настроек.")
@@ -7763,6 +7802,10 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
         save()
     end
     applyStyle()
+    if updatePopupShouldShow() and not updateState.flashOpenAsked then
+        updateState.flashOpenAsked = true
+        updatePopupOpen(false)
+    end
     local sw, sh = getScreenResolution()
     imgui.SetNextWindowSize(imgui.ImVec2(1000, 680), imgui.Cond.FirstUseEver)
     imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
