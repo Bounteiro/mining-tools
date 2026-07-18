@@ -1,7 +1,7 @@
 script_name('Mining Tools')
 script_author('SaBoARZ (t.me/SaBoARZ)')
-script_version('6.7 beta')
-script_version_number(2)
+script_version('6.7.1')
+script_version_number(3)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
 local sampfuncs = require("sampfuncs")
@@ -825,38 +825,52 @@ function updatePopupOpen(force)
 end
 function downloadAndUpdate()
     if not updateState.updateUrl then return end
+    if data.working or data.silentWindowOpen then
+        utils.addChat("{F78181}Нельзя обновлять во время операции.")
+        return
+    end
     utils.addChat("{FFE133}Загружаю обновление...")
     updateState.showPopup[0] = false
 
-    asyncHttpRequest("GET", updateState.updateUrl, {}, function(resp)
-        if resp.status_code == 200 or resp.status_code == 201 then
-            local oldPath = thisScript().path
-            local dir = oldPath:match("(.+)[/\\]")
-            local newPath = dir .. "\\Mining Tools.lua"
-            local sameFile = (oldPath:lower() == newPath:lower())
+    asyncHttpRequest("GET", updateState.updateUrl, {
+        headers = {
+            ['User-Agent'] = 'MiningTools-MoonLoader',
+            ['Cache-Control'] = 'no-cache',
+        }
+    }, function(resp)
+        local code = resp and (resp.status_code or resp.status) or 0
+        local body = ''
+        if resp then body = resp.text or resp.content or resp.body or '' end
+        if type(body) ~= 'string' then body = tostring(body) end
 
-            local file = io.open(newPath, "wb")
-            if file then
-                file:write(resp.text)
-                file:close()
-                wait(50)
-
-                -- Always write then single reload of THIS script to avoid double load/welcome
-                if not sameFile then
-                    -- keep one script: unload others with same name after reload target exists
-                    wait(50)
-                end
-                utils.addChat("{BEF781}Update saved. Reloading...")
-                wait(100)
-                thisScript():reload()
-            else
-                utils.addChat("{F78181}Не удалось сохранить файл обновления.")
+        if code == 200 or code == 201 then
+            -- Reject empty/HTML/garbage so we never wipe the script
+            if #body < 1000
+                or not body:find("script_name", 1, true)
+                or body:find("<!DOCTYPE", 1, true)
+                or body:find("<html", 1, true) then
+                utils.addChat("{F78181}Файл обновления повреждён или пустой.")
+                return
             end
+
+            -- Always overwrite THIS script file only (no second copy, no double load)
+            local path = thisScript().path
+            local f = io.open(path, "wb")
+            if not f then
+                utils.addChat("{F78181}Не удалось сохранить файл.")
+                return
+            end
+            f:write(body)
+            f:close()
+            utils.addChat("{BEF781}Обновление сохранено, перезагрузка...")
+            wait(150)
+            thisScript():reload()
         else
-            utils.addChat("{F78181}Ошибка загрузки: HTTP " .. tostring(resp.status_code))
+            utils.addChat("{F78181}Ошибка загрузки: HTTP " .. tostring(code))
         end
-    end, function()
-        utils.addChat("{F78181}Ошибка соединения при загрузке обновления.")
+    end, function(err)
+        utils.addChat("{F78181}Ошибка сети при загрузке обновления.")
+        utils.debugChat("[UPDATE] download err: " .. tostring(err or "unknown"))
     end)
 end
 
