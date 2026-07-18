@@ -1,5 +1,5 @@
 {
   "latest": "6.7 beta",
   "updateurl": "https://raw.githubusercontent.com/Bounteiro/mining-tools/main/Mining%20Tools.lua",
-  "changelog": "\u041f\u0435\u0440\u0432\u0430\u044f \u0432\u0435\u0440\u0441\u0438\u044f \u0434\u043b\u044f \u0430\u0432\u0442\u043e\u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d\u0438\u044f"
+  "changelog": "Первая версия для автообновления"
 }
