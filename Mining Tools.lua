@@ -1,7 +1,7 @@
 script_name('Mining Tools')
 script_author('bounteiro (t.me/b0unteiro)')
-script_version('6.7.3')
-script_version_number(5)
+script_version('6.7.4')
+script_version_number(6)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
 local sampfuncs = require("sampfuncs")
@@ -708,7 +708,13 @@ end)()
 -- DEBUG wrapper for sampSendDialogResponse
 local _origSampSendDialogResponse = sampSendDialogResponse
 sampSendDialogResponse = function(dialogId, button, listitem, input)
-    utils.debugChat(string.format("[DIALOG] sampSendDialogResponse (auto) | id=%d button=%d listitem=%d input=%q", dialogId, button, listitem, tostring(input or "")))
+    -- FIX: эта функция глобальная и через неё проходят вызовы ОТ ЛЮБЫХ
+    -- загруженных скриптов, не только Mining Tools. Если какой-то другой
+    -- скрипт вызывал sampSendDialogResponse без listitem/input (nil),
+    -- строгий "%d" тут крашил весь Mining Tools целиком. Используем "%s"
+    -- + tostring, чтобы лог никогда не мог уронить скрипт.
+    utils.debugChat(string.format("[DIALOG] sampSendDialogResponse (auto) | id=%s button=%s listitem=%s input=%q",
+        tostring(dialogId), tostring(button), tostring(listitem), tostring(input or "")))
     return _origSampSendDialogResponse(dialogId, button, listitem, input)
 end
 
@@ -6946,6 +6952,34 @@ imgui.OnFrame(
     end
 )
 
+-- Ручной word-wrap для текста чейнджлога: TextColoredRGB рендерит строки
+-- через imgui.Text/SameLine и сама не переносит их по ширине окна, из-за
+-- чего длинная строка вылезала за пределы окна апдейта. Разбиваем текст на
+-- строки по реальной ширине (в пикселях, без учёта цветовых тегов) заранее.
+local function wrapChangelogText(text, maxWidth)
+    if not text or text == "" or not maxWidth or maxWidth <= 0 then return text end
+    local resultLines = {}
+    for srcLine in (text .. "\n"):gmatch("(.-)\n") do
+        if srcLine == "" then
+            table.insert(resultLines, "")
+        else
+            local cur = ""
+            for word in srcLine:gmatch("%S+") do
+                local candidate = (cur == "" and word) or (cur .. " " .. word)
+                local plain = candidate:gsub("{%x%x%x%x%x%x%x?%x?}", "")
+                if cur ~= "" and imgui.CalcTextSize(plain).x > maxWidth then
+                    table.insert(resultLines, cur)
+                    cur = word
+                else
+                    cur = candidate
+                end
+            end
+            table.insert(resultLines, cur)
+        end
+    end
+    return table.concat(resultLines, "\n")
+end
+
 -- окно обновления
 imgui.OnFrame(
     function() return updateState.showPopup[0] end,
@@ -7031,9 +7065,10 @@ imgui.OnFrame(
                 imgui.PushStyleColor(imgui.Col.Border, imgui.ImVec4(0.20, 0.22, 0.28, 1))
                 imgui.BeginChild("##updateChangelog", imgui.ImVec2(0, 150), true,
                     imgui.WindowFlags.NoScrollWithMouse)
+                local changelogWrapWidth = imgui.GetContentRegionAvail().x - 8
                 imgui.Scroller("update_changelog", 20, 300,
                     imgui.HoveredFlags.RectOnly + imgui.HoveredFlags.ChildWindows)
-                imgui.TextColoredRGB(updateState.changelog)
+                imgui.TextColoredRGB(wrapChangelogText(updateState.changelog, changelogWrapWidth))
                 imgui.EndChild()
                 imgui.PopStyleColor(2)
 
