@@ -840,7 +840,14 @@ function downloadAndUpdate()
     utils.addChat("{FFE133}Загружаю обновление...")
     updateState.showPopup[0] = false
 
-    asyncHttpRequest("GET", updateState.updateUrl, {
+    -- FIX: у version.json уже был анти-кэш параметр (t=os.time()), а у самого
+    -- .lua файла — нет. raw.githubusercontent.com отдаётся через CDN, который
+    -- какое-то время (обычно до ~5 мин) может отдавать старую/пустую версию
+    -- сразу после пуша на GitHub. Добавляем такой же анти-кэш параметр сюда.
+    local dlUrl = updateState.updateUrl ..
+        ((updateState.updateUrl:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.time()))
+
+    asyncHttpRequest("GET", dlUrl, {
         headers = {
             ['User-Agent'] = 'MiningTools-MoonLoader',
             ['Cache-Control'] = 'no-cache',
