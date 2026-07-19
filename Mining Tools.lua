@@ -1,7 +1,7 @@
 script_name('Mining Tools')
-script_author('SaBoARZ (t.me/SaBoARZ)')
-script_version('6.7.2')
-script_version_number(4)
+script_author('bounteiro (t.me/b0unteiro)')
+script_version('6.7.3')
+script_version_number(5)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
 local sampfuncs = require("sampfuncs")
@@ -1798,6 +1798,13 @@ local autoRefreshTool = (function()
         if (cfg.lastAutoRefreshTime + cfg.autoRefreshInterval * 60) > now then return end
         if now < state.postponedUntil then return end
 
+        if isPaydayWindow() then
+            -- Не стартуем обновление прямо на PayDay — отложим на минуту и
+            -- проверим снова, чтобы не открывать диалог ровно в момент лага.
+            state.postponedUntil = now + 60
+            return
+        end
+
         if cfg.refreshPostponeOnDialog
             and sampIsDialogActive()
             and not data.silentWindowOpen then
@@ -2887,6 +2894,22 @@ function smart_wait(total_duration_ms, start_time_clock)
     end
 end
 
+-- Единая проверка "сейчас идёт окно PayDay" (используется и для паузы между
+-- диалоговыми действиями, и для того, чтобы вообще не запускать
+-- обновление/сканирование в этот момент). Раньше границы были ±10/20 сек и
+-- проверка дублировалась в нескольких местах с разными исключениями, из-за
+-- чего часть задач (updateStatuses/scanBasements) вообще не паузилась на
+-- PayDay — именно поэтому окно скрипта иногда зависало открытым при лаге
+-- сервера ровно на PayDay. Теперь окно шире (±20/30 сек) и проверка одна
+-- на всех.
+function isPaydayWindow()
+    local os_time = os.time()
+    local M = tonumber(os.date("%M", os_time))
+    local S = tonumber(os.date("%S", os_time))
+    return (M == 59 and S >= 40) or (M == 0 and S <= 30) or
+        (M == 29 and S >= 40) or (M == 30 and S <= 30)
+end
+
 function fixI()
     lua_thread.create(function()
         wait(0)
@@ -3408,7 +3431,9 @@ sampRegisterChatCommand('fls', function()
             wait(AUTO_REFRESH_INTERVAL * 1000)
             updateConnectionState()
             if not taskState.isAutomationAllowed() then goto continue_refresh end
-            if cfg.active and not data.working
+            if isPaydayWindow() then
+                utils.debugChat("[AUTO-REFRESH] Окно PayDay — обновление (5 мин) пропущено, повтор через 5 мин")
+            elseif cfg.active and not data.working
                 and data.hasFlashminer ~= false
                 and not cfg.autoRefreshEnabled  -- не дублировать
                 and not (cfg.refreshPostponeOnDialog and sampIsDialogActive() and not data.silentWindowOpen) then
@@ -4564,13 +4589,11 @@ function buildTaskTable(taskType, ...)
                             return false
                         end
 
-                        local os_time = os.time()
-                        local M = tonumber(os.date("%M", os_time))
-                        local S = tonumber(os.date("%S", os_time))
-
-                        return ((M == 59 and S >= 50) or (M == 0 and S <= 20) or
-                                (M == 29 and S >= 50) or (M == 30 and S <= 20)) and
-                            (taskType ~= 'updateStatuses' and taskType ~= 'scanBasements')
+                        -- FIX: раньше updateStatuses/scanBasements были исключены из паузы —
+                        -- именно эти задачи листают диалог домов, и без паузы на PayDay
+                        -- диалог мог зависнуть открытым при лаге сервера. Теперь пауза
+                        -- одинаково действует на все типы задач.
+                        return isPaydayWindow()
                     end
 
                     if isPaydayTime() and cfg.pauseOnPayday then
@@ -4579,13 +4602,7 @@ function buildTaskTable(taskType, ...)
                         utils.debugChat("{ffe133}Время PayDay...")
 
                         while not data.skipPayday do
-                            local os_time = os.time()
-                            local M = tonumber(os.date("%M", os_time))
-                            local S = tonumber(os.date("%S", os_time))
-                            local stillPayday = (M == 59 and S >= 50) or (M == 0 and S <= 20) or
-                                (M == 29 and S >= 50) or (M == 30 and S <= 20)
-
-                            if not stillPayday then break end
+                            if not isPaydayWindow() then break end
 
                             wait(500)
                             if data.stopAction then
@@ -4599,7 +4616,9 @@ function buildTaskTable(taskType, ...)
                         data.isWaitingPayday = false
                         data.skipPayday = false
                         utils.debugChat("{99ff99}Продолжаем.")
-                        wait(1000)
+                        -- Увеличенный буфер после выхода из окна PayDay (было 1000мс) —
+                        -- даёт серверу время "отпустить" лаг перед следующим действием.
+                        wait(2000)
                     end
                     sampSendDialogResponse(...)
                     action_count = action_count + 1
