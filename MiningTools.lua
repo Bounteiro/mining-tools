@@ -1,7 +1,7 @@
 script_name('Mining Tools')
 script_author('bounteiro (t.me/b0unteiro)')
-script_version('6.7.5')
-script_version_number(7)
+script_version('6.7.6')
+script_version_number(8)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
 local sampfuncs = require("sampfuncs")
