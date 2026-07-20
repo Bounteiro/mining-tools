@@ -847,47 +847,83 @@ function downloadAndUpdate()
     local dlUrl = updateState.updateUrl ..
         ((updateState.updateUrl:find('?', 1, true) and '&' or '?') .. 't=' .. tostring(os.time()))
 
-    asyncHttpRequest("GET", dlUrl, {
-        headers = {
-            ['User-Agent'] = 'MiningTools-MoonLoader',
-            ['Cache-Control'] = 'no-cache',
-        }
-    }, function(resp)
-        local code = resp and (resp.status_code or resp.status) or 0
-        local body = ''
-        if resp then body = resp.text or resp.content or resp.body or '' end
-        if type(body) ~= 'string' then body = tostring(body) end
+    -- FIX 2: раньше файл качался через effil-поток (requests в отдельном
+    -- Lua-стейте) и большое тело ответа (файл >400 КБ) передавалось обратно
+    -- в основной поток одной строкой. Проблема была не в этом (effil тело
+    -- передавал корректно), но заодно переведено на нативный MoonLoader
+    -- downloadUrlToFile — он пишет файл сразу на диск, без лишней передачи
+    -- строк между Lua-стейтами, и умеет сигнализировать таймаут/обрыв.
+    local dlstatus = require('moonloader').download_status
+    local tmpPath = thisScript().path .. ".update_tmp"
+    if doesFileExist(tmpPath) then os.remove(tmpPath) end
 
-        if code == 200 or code == 201 then
-            -- Reject empty/HTML/garbage so we never wipe the script
-            if #body < 1000
-                or not body:find("script_name", 1, true)
-                or body:find("<!DOCTYPE", 1, true)
-                or body:find("<html", 1, true) then
-                utils.addChat("{F78181}Файл обновления повреждён или пустой.")
-                return
-            end
+    local finished = false
 
-            -- Always overwrite THIS script file only (no second copy, no double load)
-            local path = thisScript().path
-            local f = io.open(path, "wb")
-            if not f then
-                utils.addChat("{F78181}Не удалось сохранить файл.")
-                return
-            end
-            f:write(body)
-            f:close()
-            utils.addChat("{BEF781}Обновление сохранено, перезагрузка...")
-            wait(150)
-            cfg.isReloaded = true
-            pcall(function() save() end)
-            thisScript():reload()
-        else
-            utils.addChat("{F78181}Ошибка загрузки: HTTP " .. tostring(code))
+    downloadUrlToFile(dlUrl, tmpPath, function(id, status, p1, p2)
+        if finished then return end
+        if status == dlstatus.STATUSEX_ENDDOWNLOAD then
+            finished = true
+            lua_thread.create(function()
+                local body = ''
+                if doesFileExist(tmpPath) then
+                    local f = io.open(tmpPath, "rb")
+                    if f then
+                        body = f:read("*a") or ''
+                        f:close()
+                    end
+                end
+
+                -- Reject empty/HTML/garbage so we never wipe the script.
+                -- ВАЖНО: HTML-маркеры ищем только в первых символах файла.
+                -- Настоящая HTML-страница-заглушка (например от CDN/прокси)
+                -- всегда начинается с "<!DOCTYPE html>" или "<html>" с самого
+                -- начала ответа. Если искать по ВСЕМУ телу — проверка находит
+                -- эти же строки в исходном коде самого MiningTools.lua (вот в
+                -- этой самой функции, как текстовые литералы) и бракует
+                -- абсолютно любое, даже полностью исправное, обновление —
+                -- именно это раньше и происходило при каждом автообновлении.
+                local head = body:sub(1, 200)
+                if #body < 1000
+                    or not body:find("script_name", 1, true)
+                    or head:find("<!DOCTYPE", 1, true)
+                    or head:find("<html", 1, true) then
+                    utils.addChat("{F78181}Файл обновления повреждён или пустой.")
+                    utils.debugChat("[UPDATE] tmp file size=" .. tostring(#body))
+                    pcall(os.remove, tmpPath)
+                    return
+                end
+
+                -- Always overwrite THIS script file only (no second copy, no double load)
+                local path = thisScript().path
+                local out = io.open(path, "wb")
+                if not out then
+                    utils.addChat("{F78181}Не удалось сохранить файл.")
+                    pcall(os.remove, tmpPath)
+                    return
+                end
+                out:write(body)
+                out:close()
+                pcall(os.remove, tmpPath)
+
+                utils.addChat("{BEF781}Обновление сохранено, перезагрузка...")
+                wait(150)
+                cfg.isReloaded = true
+                pcall(function() save() end)
+                thisScript():reload()
+            end)
         end
-    end, function(err)
-        utils.addChat("{F78181}Ошибка сети при загрузке обновления.")
-        utils.debugChat("[UPDATE] download err: " .. tostring(err or "unknown"))
+    end)
+
+    -- Страховка на случай, если downloadUrlToFile вообще не вызовет колбэк
+    -- с ENDDOWNLOAD (обрыв соединения, таймаут и т.п.)
+    lua_thread.create(function()
+        wait(20000)
+        if not finished then
+            finished = true
+            utils.addChat("{F78181}Ошибка сети при загрузке обновления (таймаут).")
+            utils.debugChat("[UPDATE] download timeout after 20s")
+            pcall(os.remove, tmpPath)
+        end
     end)
 end
 
