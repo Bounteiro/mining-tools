@@ -1,6 +1,6 @@
 script_name('Mining Tools')
 script_author('bounteiro (t.me/b0unteiro)')
-script_version('6.7.6')
+script_version('6.7.7')
 script_version_number(8)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
@@ -14,10 +14,70 @@ local effil = require('effil')
 local ffi = require('ffi')
 local fa = require('fAwesome6')
 local raknet = require('samp.raknet')
-local wm = require('windows.message')
+local okWm, wm = pcall(require, 'windows.message')
+if not okWm then
+    -- MonetLoader/Android does not provide windows.message.
+    wm = { WM_KEYDOWN = 0x0100 }
+end
 local new = imgui.new
+local unpackCompat = table.unpack or unpack
+local IS_MOBILE = MONET_VERSION ~= nil
 
---local UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Bounteiro/mining-tools/main/version.json"
+
+-- JSON compatibility layer.
+-- MoonLoader installations often ship dkjson, while MonetLoader/Android
+-- provides global encodeJson/decodeJson functions instead. Do not require an
+-- external dkjson.lua on Android: use it when available and transparently
+-- fall back to the loader's built-in implementation.
+local json = (function()
+    local ok, dkjson = pcall(require, 'dkjson')
+    if ok and type(dkjson) == 'table'
+        and type(dkjson.encode) == 'function'
+        and type(dkjson.decode) == 'function' then
+        return dkjson
+    end
+
+    local compat = {}
+
+    function compat.encode(value, options)
+        if type(encodeJson) ~= 'function' then
+            error("JSON encoder is unavailable: neither dkjson nor encodeJson was found")
+        end
+
+        -- Some loader builds accept a pretty-print flag, while others only
+        -- accept the value itself. Try the readable form first, then retry
+        -- with the universally supported one-argument call.
+        local pretty = type(options) == 'table' and options.indent ~= nil
+        local encodeOk, encoded = pcall(encodeJson, value, pretty)
+        if not encodeOk then
+            encodeOk, encoded = pcall(encodeJson, value)
+        end
+        if not encodeOk then error(encoded) end
+        if type(encoded) ~= 'string' then
+            error("encodeJson returned " .. type(encoded) .. " instead of string")
+        end
+        return encoded
+    end
+
+    function compat.decode(content)
+        if type(decodeJson) ~= 'function' then
+            return nil, nil, "JSON decoder is unavailable: neither dkjson nor decodeJson was found"
+        end
+
+        local decodeOk, decoded = pcall(decodeJson, content)
+        if not decodeOk then
+            return nil, nil, tostring(decoded)
+        end
+        if decoded == nil then
+            return nil, nil, "invalid JSON"
+        end
+        return decoded, nil, nil
+    end
+
+    return compat
+end)()
+
+local AUTO_UPDATE_ENABLED = true
 local UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Bounteiro/mining-tools/main/version.json"
 
 local searchBuffer = new.char[256]()
@@ -25,6 +85,20 @@ local currentStatusFilter = new.int(0)
 local selectedCardLevels = {}
 local selectedCities = {}
 local _snapshotSaveT = 0
+
+-- os.clock() measures CPU time and is unsuitable for waits/timeouts under Wine.
+-- Build a monotonic wall clock from the GTA timer, including uint32 wrap handling.
+local _monoLastMs = getGameTimer()
+local _monoTotalMs = 0
+local function monotonicSeconds()
+    local now = getGameTimer()
+    local delta = (now - _monoLastMs) % 4294967296
+    -- A backwards jump larger than half the uint32 range is not elapsed time.
+    if delta > 2147483648 then delta = 0 end
+    _monoTotalMs = _monoTotalMs + delta
+    _monoLastMs = now
+    return _monoTotalMs / 1000
+end
 
 local sortItems = { "По номеру", "По балансу", "По циклам", "По жидкости", "По видеокартам", "По городу" }
 local statusItems = { "Все дома", "В норме", "Требует внимания", "Есть проблемы", "Без подвала" }
@@ -68,12 +142,12 @@ end
 
 local dialogIdTable          = {
     arizona = {
-        videoCardSt = 25244,             -- ID диалога полки
-        videoCardDialogId = 25245,       -- ID диалога управления видеокартой (Стойка/Полка)
-        coolantDialogId = 25271,         -- ID диалога выбора охлаждающей жидкости
+        videoCardSt = 25243,             -- ID диалога полки
+        videoCardDialogId = 25244,       -- ID диалога управления видеокартой (Стойка/Полка)
+        coolantDialogId = 25270,         -- ID диалога выбора охлаждающей жидкости
         houseDialogId = 7238,            -- ID диалога выбора дома
         houseFlashMinerDialogId = 25182, -- ID диалога выбора видеокарты в доме
-        videoCardAcceptDialogId = 25246, -- ID диалога подтверждения вывода прибыли
+        videoCardAcceptDialogId = 25245, -- ID диалога подтверждения вывода прибыли
 
         phoneBankMenuId = 6565,          -- ID главного меню банка в телефоне
         payAllTaxesDialogId = 15252,     -- ID диалога подтверждения оплаты всех налогов
@@ -101,18 +175,25 @@ do
 
     function Jcfg.__init()
         local self = {}
-        local json = require('dkjson')
 
         local function makeDirectory(path)
-            assert(type(path) == "string" and path:find('moonloader'),
-                "Path must be a string and include 'moonloader' folder")
-            path = path:gsub("[\\/][^\\/]+%.json$", "")
+            assert(type(path) == "string", "Path must be a string")
+
+            -- MonetLoader работает с Android/Linux-путями. Нормализуем также
+            -- старые конфиги MoonLoader, где могли сохраниться обратные слеши.
+            path = path:gsub("\\", "/")
+            path = path:gsub("/[^/]+%.json$", "")
+            path = path:gsub("/[^/]+%.txt$", "")
             if doesDirectoryExist(path) then return end
 
-            -- Создаём папки по цепочке (path может быть вложенным, например profiles\КлючПрофиля)
-            local accum = ""
-            for part in path:gmatch("[^\\/]+") do
-                accum = (accum == "") and part or (accum .. "\\" .. part)
+            local absolute = path:sub(1, 1) == "/"
+            local accum = absolute and "/" or ""
+            for part in path:gmatch("[^/]+") do
+                if accum == "" or accum == "/" then
+                    accum = accum .. part
+                else
+                    accum = accum .. "/" .. part
+                end
                 if not doesDirectoryExist(accum) then
                     createDirectory(accum)
                 end
@@ -155,31 +236,80 @@ do
             assert(path == nil or type(path) == "string", "Path must be nil or a valid file path.")
             if not path then
                 assert(thisScript().name, "Script name is not defined")
-                path = getWorkingDirectory() .. '\\config\\' .. thisScript().name .. '\\config.json'
+                path = getWorkingDirectory() .. '/config/' .. thisScript().name .. '/config.json'
             end
             makeDirectory(path)
-            local file = io.open(path, "w")
-            if file then
-                file:write(json.encode(table, { indent = true }))
-                file:close()
-            else
-                error("Could not open file for writing: " .. path)
+
+            local okEncode, encoded = pcall(json.encode, table, { indent = true })
+            if not okEncode or type(encoded) ~= 'string' then
+                error("Could not encode configuration: " .. tostring(encoded))
+            end
+
+            local tmpPath = path .. '.tmp'
+            local bakPath = path .. '.bak'
+            local file = io.open(tmpPath, "wb")
+            if not file then
+                error("Could not open temporary file for writing: " .. tmpPath)
+            end
+            local okWrite, writeErr = pcall(function()
+                assert(file:write(encoded))
+                file:flush()
+            end)
+            file:close()
+            if not okWrite then
+                pcall(os.remove, tmpPath)
+                error("Could not write configuration: " .. tostring(writeErr))
+            end
+
+            -- Keep the last known-good file and replace the main file only after
+            -- the new JSON has been written completely.
+            if doesFileExist(bakPath) then pcall(os.remove, bakPath) end
+            if doesFileExist(path) then
+                local movedOld, moveOldErr = os.rename(path, bakPath)
+                if not movedOld then
+                    pcall(os.remove, tmpPath)
+                    error("Could not create configuration backup: " .. tostring(moveOldErr))
+                end
+            end
+
+            local movedNew, moveNewErr = os.rename(tmpPath, path)
+            if not movedNew then
+                if doesFileExist(bakPath) then pcall(os.rename, bakPath, path) end
+                pcall(os.remove, tmpPath)
+                error("Could not replace configuration: " .. tostring(moveNewErr))
             end
         end
 
         function self.load(path)
             if not path then
-                path = getWorkingDirectory() .. '\\config\\' .. thisScript().name .. '\\config.json'
+                path = getWorkingDirectory() .. '/config/' .. thisScript().name .. '/config.json'
             end
-            if doesFileExist(path) then
-                local file = io.open(path, "r")
-                if file then
-                    local content = file:read("*all")
-                    file:close()
-                    return json.decode(content)
-                else
-                    return error("Could not load configuration")
+
+            local function decodeFile(filePath)
+                if not doesFileExist(filePath) then return nil, 'file does not exist' end
+                local file = io.open(filePath, "rb")
+                if not file then return nil, 'could not open file' end
+                local content = file:read("*all") or ''
+                file:close()
+                local ok, result, _, decodeErr = pcall(json.decode, content)
+                if ok and type(result) == 'table' and not decodeErr then
+                    return result
                 end
+                return nil, tostring(decodeErr or result or 'invalid JSON')
+            end
+
+            local result, loadErr = decodeFile(path)
+            if result then return result end
+
+            local backup, backupErr = decodeFile(path .. '.bak')
+            if backup then
+                print(string.format('[Mining Tools] Invalid config %s (%s); loaded backup.', path, tostring(loadErr)))
+                return backup
+            end
+
+            if doesFileExist(path) then
+                print(string.format('[Mining Tools] Could not load config %s: %s; backup: %s',
+                    path, tostring(loadErr), tostring(backupErr)))
             end
             return {}
         end
@@ -231,11 +361,11 @@ local function sanitizeForPath(s)
 end
 
 local function getProfilesDir()
-    return getWorkingDirectory() .. '\\config\\' .. thisScript().name .. '\\profiles\\'
+    return getWorkingDirectory() .. '/config/' .. thisScript().name .. '/profiles/'
 end
 
 local function getPointerPath()
-    return getWorkingDirectory() .. '\\config\\' .. thisScript().name .. '\\active_profile.txt'
+    return getWorkingDirectory() .. '/config/' .. thisScript().name .. '/active_profile.txt'
 end
 
 local function readPointer()
@@ -253,7 +383,7 @@ local function readPointer()
 end
 
 local function writePointer(key)
-    local dir = getWorkingDirectory() .. '\\config\\' .. thisScript().name
+    local dir = getWorkingDirectory() .. '/config/' .. thisScript().name
     if not doesDirectoryExist(dir) then createDirectory(dir) end
     local f = io.open(getPointerPath(), 'w')
     if f then
@@ -263,18 +393,18 @@ local function writePointer(key)
 end
 
 local function getProfileConfigPath(key)
-    return getProfilesDir() .. key .. '\\config.json'
+    return getProfilesDir() .. key .. '/config.json'
 end
 
 local function getProfileLogsPath(key)
-    return getProfilesDir() .. key .. '\\logs.json'
+    return getProfilesDir() .. key .. '/logs.json'
 end
 
 -- Ждём, пока станет известен ник локального игрока (сразу после коннекта его может
 -- ещё не быть, поэтому пробуем в течение timeoutMs).
 local function waitForNickname(timeoutMs)
-    local start = os.clock()
-    while (os.clock() - start) * 1000 < timeoutMs do
+    local start = monotonicSeconds()
+    while (monotonicSeconds() - start) * 1000 < timeoutMs do
         if isSampAvailable and isSampAvailable() then
             local pok, found, pid = pcall(sampGetPlayerIdByCharHandle, PLAYER_PED)
             if pok and found and pid then
@@ -299,9 +429,12 @@ local function getDefaultCfg()
         active                   = true,
         debug                    = false,
         silentMode               = false,
-        checkForUpdates          = true,
+        checkForUpdates          = false,
         useDialogMode            = false,
+        hideCardSampDialog       = false, -- false: SAMP dialog remains behind the large mimgui window
         helpShown                = false,
+        afkMode = false,
+        afkCloseDelay = 30,
 
         -- Оформление
         accentColor              = { 0.16, 0.38, 0.62 },
@@ -389,12 +522,69 @@ local function getDefaultCfg()
         fixSwitchEnabled         = true,
         fixCollectEnabled        = true,
         fixCoolantEnabled        = false,
+        incomeStatsResetV2       = false,
     }
 end
 
 local cfg = getDefaultCfg()
 
+local function normalizeConfig(c)
+    local defaults = getDefaultCfg()
+    for k, defaultValue in pairs(defaults) do
+        if type(c[k]) ~= type(defaultValue) then c[k] = defaultValue end
+    end
+
+    local function number(key, minValue, maxValue, integer)
+        local n = tonumber(c[key])
+        if not n or n ~= n or n == math.huge or n == -math.huge then n = defaults[key] end
+        if minValue ~= nil then n = math.max(minValue, n) end
+        if maxValue ~= nil then n = math.min(maxValue, n) end
+        if integer then n = math.floor(n + 0.5) end
+        c[key] = n
+    end
+
+    number('useCoolantPercent', 0, 100, true)
+    number('pause_duration', 0, 10000, true)
+    number('count_action', 1, 100, true)
+    number('currentSort', 0, 5, true)
+    number('targetHouseBalance', 0, 59999999, true)
+    number('minBalanceWarning', 0, 59999999, true)
+    number('collectTimesPerDay', 1, 24, true)
+    number('lastCollectTime', 0, nil, true)
+    number('collectOnlyIfMin', 0, nil, false)
+    number('smartCollectTarget', 0, nil, false)
+    number('randomDelayMin', 1, 180, true)
+    number('randomDelayMax', 1, 180, true)
+    if c.randomDelayMin > c.randomDelayMax then
+        c.randomDelayMin, c.randomDelayMax = c.randomDelayMax, c.randomDelayMin
+    end
+    number('autoPayTaxesInterval', 1, 168, true)
+    number('lastTaxPayTime', 0, nil, true)
+    number('autoTopUpThreshold', 0, 59999999, true)
+    number('autoTopUpTimerInterval', 1, 168, true)
+    number('lastAutoTopUpTime', 0, nil, true)
+    number('autoRefreshInterval', 1, 1440, true)
+    number('lastAutoRefreshTime', 0, nil, true)
+    number('refreshPostponeMinutes', 1, 120, true)
+    number('delayAfterConnectMin', 0, 120, true)
+    number('reminderInterval', 1, 1440, true)
+    number('btcThreshold', 0, nil, false)
+    number('notifyBeforeSec', 0, 3600, true)
+    number('notifyShowDuration', 1, 120, true)
+    number('notifyWindowPosX', 0, 1, false)
+    number('notifyWindowPosY', 0, 1, false)
+    number('logsWindowPosX', 0, 1, false)
+    number('logsWindowPosY', 0, 1, false)
+
+    if type(c.accentColor) ~= 'table' then c.accentColor = { 0.16, 0.38, 0.62 } end
+    for i, fallback in ipairs({ 0.16, 0.38, 0.62 }) do
+        local value = tonumber(c.accentColor[i]) or fallback
+        c.accentColor[i] = math.max(0, math.min(1, value))
+    end
+end
+
 jcfg.update(cfg, activeConfigPath)
+normalizeConfig(cfg)
 local imcfg = jcfg.setupImgui(cfg)
 
 function save()
@@ -483,10 +673,14 @@ end
 local data = {
     -- Окна
     main                   = imgui.new.bool(false),
+    cardDialogSessionActive = false,
+    cardDialogId            = nil,
+    cardControlNeedsFocus   = false,
     showHouseControlWindow = imgui.new.bool(false),
     showLogsWindow         = imgui.new.bool(false),
     showSettingsWindow     = imgui.new.bool(false),
     showHelpWindow         = imgui.new.bool(false),
+    mainWindowResetRequested = false,
     helpPage               = 1,
     setupPage              = 1,
     helpWindowMode         = 'reference',
@@ -532,6 +726,7 @@ local data = {
     silentWindowOpen       = false,
     stopAction             = false,
     topUpLastFailed       = false,
+    topUpLastSucceeded    = false,
     suppressDialogs        = false,
     suppressDialogsUntil   = 0,
     stopBySystem           = false,
@@ -542,7 +737,7 @@ local data = {
     },
     connectionState        = {
         connected           = false,
-        wasDisconnected     = true,
+        wasDisconnected     = false,
         readyAfterConnect   = 0,
         lastCheck           = 0,
         profileCheckPending = false,
@@ -654,7 +849,7 @@ local utils = (function()
     end
 
     function samp_create_sync_data(sync_type, copy_from_player)
-        copy_from_player = copy_from_player or true
+        if copy_from_player == nil then copy_from_player = true end
         local sync_traits = {
             player = { 'PlayerSyncData', raknet.PACKET.PLAYER_SYNC, sampStorePlayerOnfootData },
             vehicle = { 'VehicleSyncData', raknet.PACKET.VEHICLE_SYNC, sampStorePlayerIncarData },
@@ -768,11 +963,17 @@ function requestRunner()
     end)
 end
 
-function handleAsyncHttpRequestThread(requestThread, successCallback, errorCallback)
+function handleAsyncHttpRequestThread(requestThread, successCallback, errorCallback, timeoutMs)
     local threadStatus, threadError
+    local startedAt = monotonicSeconds()
+    timeoutMs = timeoutMs or 15000
     repeat
         threadStatus, threadError = requestThread:status()
-        wait(0)
+        if (monotonicSeconds() - startedAt) * 1000 >= timeoutMs then
+            pcall(function() requestThread:cancel() end)
+            return errorCallback('timeout')
+        end
+        wait(10)
     until threadStatus ~= 'running'
     if not threadError then
         if threadStatus == 'completed' then
@@ -798,7 +999,7 @@ function asyncHttpRequest(httpMethod, url, requestBody, successCallback, errorCa
     return {
         effilRequestThread  = requestThread,
         luaHttpHandleThread = lua_thread.create(
-            handleAsyncHttpRequestThread, requestThread, successCallback, errorCallback
+            handleAsyncHttpRequestThread, requestThread, successCallback, errorCallback, 15000
         )
     }
 end
@@ -819,6 +1020,7 @@ local updateState = {
 
 
 function updatePopupShouldShow()
+    if not AUTO_UPDATE_ENABLED then return false end
     if not updateState.hasUpdate then return false end
     if updateState.declined then return false end
     if (updateState.postponeUntil or 0) > os.time() then return false end
@@ -832,6 +1034,10 @@ function updatePopupOpen(force)
     return true
 end
 function downloadAndUpdate()
+    if not AUTO_UPDATE_ENABLED then
+        utils.addChat("{FFE133}Автообновление временно отключено в этой сборке.")
+        return
+    end
     if not updateState.updateUrl then return end
     if data.working or data.silentWindowOpen then
         utils.addChat("{F78181}Нельзя обновлять во время операции.")
@@ -928,6 +1134,7 @@ function downloadAndUpdate()
 end
 
 function checkForUpdates()
+    if not AUTO_UPDATE_ENABLED then return end
     if not cfg.checkForUpdates or updateState.checking then return end
     if UPDATE_CHECK_URL == nil then return end
     updateState.checking = true
@@ -937,7 +1144,6 @@ function checkForUpdates()
     asyncHttpRequest("GET", checkUrl, { headers = { ['User-Agent'] = 'MiningTools-MoonLoader', ['Cache-Control'] = 'no-cache' } }, function(resp)
         updateState.checking = false
         if resp.status_code == 200 or resp.status_code == 304 then
-            local json     = require('dkjson')
             local ok, info = pcall(json.decode, resp.text)
             if ok and info and info.latest then
                 if info.latest ~= script.this.version then
@@ -1020,19 +1226,19 @@ local dialogActions = {
         sr(dialogIdTable.videoCardDialogId, 0, 0, "")
     end,
     refillCoolant = function(sr, fluidType, useSuper, isAsic)
-        local coolantIndex
-        if data.isRodina then
-            coolantIndex = isAsic and 3 or 2
-        else
-            coolantIndex = isAsic and 4 or 3
-        end
-        sr(dialogIdTable.videoCardDialogId, 1, coolantIndex, "")
-        local fluid_listitem = (fluidType == 1 and (useSuper and 1 or 0)) or
-            (fluidType == 2 and (useSuper and 1 or 2))
-        if fluid_listitem ~= nil then
-            sr(dialogIdTable.coolantDialogId, 1, fluid_listitem, "")
-        end
+    local coolantIndex
+    if data.isRodina then
+        coolantIndex = 2
+    else
+        coolantIndex = 3
     end
+    sr(dialogIdTable.videoCardDialogId, 1, coolantIndex, "")
+    local fluid_listitem = (fluidType == 1 and (useSuper and 1 or 0)) or
+        (fluidType == 2 and (useSuper and 1 or 2))
+    if fluid_listitem ~= nil then
+        sr(dialogIdTable.coolantDialogId, 1, fluid_listitem, "")
+    end
+end
 }
 
 -- Склонение русских существительных по числу (1 карта / 2 карты / 5 карт)
@@ -1057,7 +1263,7 @@ local logsTool = (function()
     -- Legacy-путь остаётся как fallback только на самый первый запуск, пока профиль
     -- ещё не определён (до первого коннекта/ника).
     local _logsPath           = activeProfileKey and getProfileLogsPath(activeProfileKey)
-        or (getWorkingDirectory() .. '\\config\\' .. thisScript().name .. '\\logs.json')
+        or (getWorkingDirectory() .. '/config/' .. thisScript().name .. '/logs.json')
     local _logs               = {}
     local _cache              = { collectBtc = 0, collectAsc = 0, sessions = 0 }
     local _statsCache         = { dirty = true, buildDate = "", byPeriod = {} }
@@ -1140,8 +1346,8 @@ local logsTool = (function()
         if period == 1 then return dateStr == os.date('%d.%m.%Y') end
         local entryTime = os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d) })
         local diff = os.time() - entryTime
-        if period == 2 then return diff < 7 * 86400 end
-        if period == 3 then return diff < 30 * 86400 end
+        if period == 2 then return diff >= 0 and diff < 7 * 86400 end
+        if period == 3 then return diff >= 0 and diff < 30 * 86400 end
         return true
     end
 
@@ -1229,12 +1435,13 @@ local logsTool = (function()
     end
 
     function self.add(action, details)
+        details = details or {}
         local dateStr = os.date('%d.%m.%Y')
         local timeStr = os.date('%H:%M')
         if not _logs[dateStr] then _logs[dateStr] = {} end
         local serverName = isSampAvailable and isSampAvailable() and sampGetCurrentServerName() or nil
         local entry = { time = timeStr, action = action, isVC = data.isViceCity, server = serverName }
-        for k, v in pairs(details or {}) do entry[k] = v end
+        for k, v in pairs(details) do entry[k] = v end
         table.insert(_logs[dateStr], entry)
         _cache.sessions = _cache.sessions + 1
         if action == 'collect' or action == 'fix' then
@@ -1339,8 +1546,6 @@ local logsTool = (function()
     return self
 end)()
 
-logsTool.load()
-
 -- Для парсинга
 local flashminerTool = (function()
     local self = {}
@@ -1425,7 +1630,7 @@ local flashminerTool = (function()
                 tax = tonumber(parts[cycles_index - 2])
                 local city_end = tax and (cycles_index - 3) or (cycles_index - 2)
                 if city_end >= 1 then
-                    city = table.concat({ table.unpack(parts, 1, city_end) }, " ")
+                    city = table.concat({ unpackCompat(parts, 1, city_end) }, " ")
                 else
                     city = ""
                 end
@@ -1459,7 +1664,7 @@ local flashminerTool = (function()
 
             if is_current then
                 data.currentFlashminerHouseNumber = house_data.house_number
-                data.currentFlashminerHouseAt = os.clock()
+                data.currentFlashminerHouseAt = monotonicSeconds()
                 utils.debugChat(string.format("[HOUSE] Flashminer current mark detected: #%d", house_data.house_number))
             end
 
@@ -1574,12 +1779,12 @@ local taskState = (function()
         data.suppressDialogs =
             data.working
             or data.silentWindowOpen
-            or (os.clock() < (data.suppressDialogsUntil or 0))
+            or (monotonicSeconds() < (data.suppressDialogsUntil or 0))
     end
 
     function self.setWorking(state)
         if data.working and not state then
-            data.suppressDialogsUntil = os.clock() + SUPPRESS_TAIL_SEC
+            data.suppressDialogsUntil = monotonicSeconds() + SUPPRESS_TAIL_SEC
         end
         data.working = state
         self.refreshSuppressDialogs()
@@ -1587,7 +1792,7 @@ local taskState = (function()
 
     function self.setSilent(state)
         if data.silentWindowOpen and not state then
-            data.suppressDialogsUntil = os.clock() + SUPPRESS_TAIL_SEC
+            data.suppressDialogsUntil = monotonicSeconds() + SUPPRESS_TAIL_SEC
         end
         data.silentWindowOpen = state
         self.refreshSuppressDialogs()
@@ -1717,12 +1922,16 @@ local taxTool = (function()
     local self  = {}
     local state = {
         capturedAmount = 0,
+        confirmed      = false,
+        nothingToPay   = false,
     }
 
     function self.handleShowDialog(dialogId, style, title, button1, button2, text, placeholder)
         if (title or ''):find("Оплата всех налогов")
             and (text or ''):find("нет налогов")
             and data.taskTypeNow == 'autoPayTaxes' then
+            state.confirmed = true
+            state.nothingToPay = true
             sampSendDialogResponse(dialogId, 1, 0, "")
             return true
         end
@@ -1737,6 +1946,7 @@ local taxTool = (function()
                 local clean = amount_str:gsub("[^%d]", "")
                 if clean ~= "" then state.capturedAmount = tonumber(clean) or 0 end
             end
+            state.confirmed = true
             return true
         end
         return false
@@ -1764,9 +1974,15 @@ local taxTool = (function()
         while data.working do wait(200) end
     end
 
-    function self.resetCapturedAmount() state.capturedAmount = 0 end
+    function self.resetCapturedAmount()
+        state.capturedAmount = 0
+        state.confirmed = false
+        state.nothingToPay = false
+    end
 
     function self.getCapturedAmount() return state.capturedAmount end
+    function self.isConfirmed() return state.confirmed end
+    function self.wasNothingToPay() return state.nothingToPay end
 
     return self
 end)()
@@ -1828,43 +2044,48 @@ local autoRefreshTool = (function()
     }
 
     function self.runSilent()
-        local result = withSilentFlashminer(function()
-            local updateTask = buildTaskTable('updateStatuses')
-            updateTask:run()
-            wait(300)
-            while data.working do wait(200) end
-        end)
-        cfg.lastAutoRefreshTime = os.time()
-        save()
+    if sampIsDialogActive() then
+        sampCloseCurrentDialogWithButton(0)
+        wait(300)
+    end
+    local result = withSilentFlashminer(function()
+        local updateTask = buildTaskTable('updateStatuses')
+        updateTask:run()
+        wait(300)
+        while data.working do wait(200) end
+    end)
         if result then
+            cfg.lastAutoRefreshTime = os.time()
+            save()
             utils.debugChat("[REFRESH] Фоновое обновление статусов завершено.")
+        else
+            state.postponedUntil = os.time() + 60
+            utils.debugChat("[REFRESH] Обновление не выполнено, повтор через 1 мин.")
         end
         return result
     end
 
     function self.tickTimer(now)
-        if not cfg.autoRefreshEnabled then return end
-        if (cfg.lastAutoRefreshTime + cfg.autoRefreshInterval * 60) > now then return end
-        if now < state.postponedUntil then return end
+    if not cfg.autoRefreshEnabled then return end
+    if (cfg.lastAutoRefreshTime + cfg.autoRefreshInterval * 60) > now then return end
+    if now < state.postponedUntil then return end
 
-        if isPaydayWindow() then
-            -- Не стартуем обновление прямо на PayDay — отложим на минуту и
-            -- проверим снова, чтобы не открывать диалог ровно в момент лага.
-            state.postponedUntil = now + 60
-            return
-        end
-
-        if cfg.refreshPostponeOnDialog
-            and sampIsDialogActive()
-            and not data.silentWindowOpen then
-            state.postponedUntil = now + cfg.refreshPostponeMinutes * 60
-            utils.debugChat(string.format(
-                "[REFRESH] Диалог открыт — обновление отложено на %d мин.",
-                cfg.refreshPostponeMinutes))
-        else
-            self.runSilent()
-        end
+    if isPaydayWindow() then
+        state.postponedUntil = now + 60
+        return
     end
+
+    if sampIsDialogActive() then
+        sampCloseCurrentDialogWithButton(0)
+        wait(300)
+    end
+
+    if cfg.refreshPostponeOnDialog and sampIsDialogActive() then
+        state.postponedUntil = now + cfg.refreshPostponeMinutes * 60
+    else
+        self.runSilent()
+    end
+end
 
     function self.getPostponedUntil() return state.postponedUntil end
 
@@ -1877,18 +2098,7 @@ local collectTool = (function()
 
     local triggerState = { reminder = {}, scheduled = {}, smart = {} }
 
-    -- FIX: СЂР°РЅСЊС€Рµ Р·РґРµСЃСЊ СЃСѓРјРјРёСЂРѕРІР°Р»РёСЃСЊ "СЃС‹СЂС‹Рµ" st.earnings.btc/asc вЂ” С‚Рѕ РµСЃС‚СЊ
-    -- Р·РЅР°С‡РµРЅРёСЏ РЅР° РјРѕРјРµРЅС‚ РџРћРЎР›Р•Р”РќР•Р“Рћ РѕС‚РєСЂС‹С‚РёСЏ РґРёР°Р»РѕРіР° РґРѕРјР°/СЃС‚РѕР№РєРё, Р±РµР· СѓС‡С‘С‚Р°
-    -- РІСЂРµРјРµРЅРё, РїСЂРѕС€РµРґС€РµРіРѕ СЃ СЌС‚РѕРіРѕ РјРѕРјРµРЅС‚Р°. Р•СЃР»Рё РґРѕРј РґРѕР»РіРѕ РЅРµ РїСЂРѕРІРµСЂСЏР»СЃСЏ,
-    -- st.earnings РѕСЃС‚Р°РІР°Р»СЃСЏ СЃС‚Р°СЂС‹Рј (Р·Р°РЅРёР¶РµРЅРЅС‹Рј), РїРѕСЌС‚РѕРјСѓ "СѓРјРЅС‹Р№ Р°РІС‚РѕСЃР±РѕСЂ"
-    -- РґСѓРјР°Р», С‡С‚Рѕ РґРѕ С†РµР»Рё РµС‰С‘ РґР°Р»РµРєРѕ, С…РѕС‚СЏ РїРѕ С„Р°РєС‚Сѓ С†РµР»СЊ СѓР¶Рµ Р±С‹Р»Р° РїСЂРµРІС‹С€РµРЅР°
-    -- Р·Р° СЃС‡С‘С‚ СЂРµР°Р»СЊРЅРѕРіРѕ РЅР°РєРѕРїР»РµРЅРёСЏ. РљР°Рє С‚РѕР»СЊРєРѕ РёРіСЂРѕРє РІСЂСѓС‡РЅСѓСЋ РѕС‚РєСЂС‹РІР°Р»
-    -- РґРёР°Р»РѕРі СЃС‚РѕР№РєРё/РґРѕРјР°, РґР°РЅРЅС‹Рµ СЂРµР·РєРѕ РѕР±РЅРѕРІР»СЏР»РёСЃСЊ РґРѕ Р°РєС‚СѓР°Р»СЊРЅС‹С…, С‚СЂРёРіРіРµСЂ
-    -- С‚СѓС‚ Р¶Рµ РІРёРґРµР» total >= cfg.smartCollectTarget Рё Р·Р°РїСѓСЃРєР°Р» СЃР±РѕСЂ вЂ” РѕС‚СЃСЋРґР°
-    -- РѕС‰СѓС‰РµРЅРёРµ "С‚РєРЅСѓР» СЃС‚РѕР№РєСѓ вЂ” Рё РІРЅРµР·Р°РїРЅРѕ РЅР°С‡Р°Р»СЃСЏ СЃР±РѕСЂ", Р° СЃР°Рј СЃР±РѕСЂ СЃРЅРёРјР°Р»
-    -- Р±РѕР»СЊС€Рµ С†РµР»Рё Рё РїРѕР·Р¶Рµ, С‡РµРј РґРѕР»Р¶РµРЅ Р±С‹Р» (С†РµР»СЊ Р±С‹Р»Р° РїСЂРѕР№РґРµРЅР° СѓР¶Рµ РґР°РІРЅРѕ,
-    -- РїСЂРѕСЃС‚Рѕ СЃРєСЂРёРїС‚ РѕР± СЌС‚РѕРј РЅРµ Р·РЅР°Р»). РўРµРїРµСЂСЊ СЃС‡РёС‚Р°РµРј С‚Р°Рє Р¶Рµ, РєР°Рє РІ
-    -- estimateTotalBTC(): known + (РґРЅРµРІРЅРѕР№ РґРѕС…РѕРґ / 24) * С‡Р°СЃРѕРІ СЃ РїСЂРѕРІРµСЂРєРё.
+
     local function getSmartAggregate()
         local hasData, totalBtc, totalAsc, totalDailyBtc, totalDailyAsc = false, 0, 0, 0, 0
         local now = os.time()
@@ -2154,12 +2364,12 @@ local collectTool = (function()
         data.showLogsWindow[0]     = false
         data.showSettingsWindow[0] = false
 
-        -- РћР±РЅРѕРІР»СЏРµРј СЃРїРёСЃРѕРє РґРѕРјРѕРІ РїРµСЂРµРґ СЃР±РѕСЂРѕРј (РІСЃРµРіРґР°)
+    
         data.dialogData.flashminer = {}
         local attempts = 0
         while #data.dialogData.flashminer == 0 and attempts < 3 do
             attempts = attempts + 1
-            sampSendChat("/flashminer")
+                 sampSendChat("/flashminer")
             local t = 0
             while #data.dialogData.flashminer == 0 and t < 8000 do
                 wait(200); t = t + 200
@@ -2230,22 +2440,44 @@ local collectTool = (function()
             end
         end
         if cfg.autoEnableCardsOnCollect then
-            wait(300)
-            if flashminerTool.requestList(5000) then
-                local switchTask = buildTaskTable('massSwitchCards')
-                switchTask:run(true)
-                while data.working do
-                    wait(200)
-                    if data.collectCancelled then
-                        data.collectCancelled = false
-                        taskState.setSilent(false)
-                        data.stopAction = true
-                        data.silentWindowOpen = false
-                        return false
+    wait(300)
+    if flashminerTool.requestList(5000) then
+        progressTracker.reset()
+        data.currentCollectHouse = ""
+        local housesWithCards = 0
+        for _, house in ipairs(data.dialogData.flashminer) do
+            if houseFilter.shouldProcess(house) then
+                local status = data.houseStatuses[house.house_number]
+                if status and status.cardLevels then
+                    local total, working = 0, 0
+                    for _, lvl in pairs(status.cardLevels) do
+                        total = total + lvl.total
+                        working = working + lvl.working
+                    end
+                    if total > working then
+                        housesWithCards = housesWithCards + 1
                     end
                 end
             end
         end
+        data.progressCurrent = 0
+        data.progressTotal = housesWithCards
+        local switchTask = buildTaskTable('massSwitchCards')
+        switchTask:run(true)
+        while data.working do
+            wait(200)
+            if data.collectCancelled then
+                data.collectCancelled = false
+                taskState.setSilent(false)
+                data.stopAction = true
+                data.silentWindowOpen = false
+                return false
+            end
+        end
+        data.progressCurrent = 0
+        data.progressTotal = 0
+    end
+end
 
         taxTool.runWithCollect()
         autoTopUpTool.runWithCollect()
@@ -2931,7 +3163,7 @@ end
 
 function smart_wait(total_duration_ms, start_time_clock)
     if start_time_clock then
-        local remaining_time_ms = total_duration_ms - (os.clock() - start_time_clock) * 1000
+        local remaining_time_ms = total_duration_ms - (monotonicSeconds() - start_time_clock) * 1000
 
         if remaining_time_ms > 0 then
             wait(remaining_time_ms)
@@ -2960,19 +3192,31 @@ function isPaydayWindow()
 end
 
 function fixI()
-    lua_thread.create(function()
-        wait(0)
-        data.fix = true
-        -- FIX: раньше здесь посылалась команда "/mm", которая на Arizona открывает кастомный
-        -- чат-панель с вкладками ("Общий/Семья/VIP..."), который не является SAMP-диалогом,
-        -- не закрывается через sampCloseCurrentDialogWithButton и после этого остается висеть на экране.
-        -- Теперь просто напрямую закрываем собственный диалог скрипта, если он завис.
-        if sampIsDialogActive() and isOwnScriptDialogId(sampGetCurrentDialogId()) then
-            sampCloseCurrentDialogWithButton(0)
+    -- Отключено временно (test)
+end
+
+-- Закрывает большое окно управления видеокартами и, при необходимости,
+-- отправляет отмену в лежащий под ним (или полностью скрытый) SAMP-диалог.
+function closeCardControlWindow(sendCancel)
+    local dialogId = tonumber(data.cardDialogId or data.dFlashminerId)
+    data.cardDialogSessionActive = false
+    data.cardControlNeedsFocus = false
+    data.main[0] = false
+
+    if sendCancel and dialogId then
+        local activeId = sampIsDialogActive() and sampGetCurrentDialogId() or nil
+        if activeId == dialogId then
+            pcall(sampCloseCurrentDialogWithButton, 0)
+        elseif cfg.hideCardSampDialog then
+            -- В полностью скрытом режиме диалог не попадает в стандартный UI,
+            -- но сервер всё равно ожидает ответ на его dialogId.
+            pcall(sampSendDialogResponse, dialogId, 0, 0, "")
         end
-        wait(200)
-        data.fix = false
-    end)
+    end
+
+    data.cardDialogId = nil
+    data.showSettingsWindow[0] = false
+    pcall(fixI)
 end
 
 -- Проверяет связку сервер+ник и при необходимости переключает профиль.
@@ -2984,10 +3228,10 @@ end
 -- (в этом случае дальнейший код в вызывающем месте выполнять не нужно).
 local function checkAndSwitchProfile(sn, nick)
     sn = sn or (isSampAvailable() and sampGetCurrentServerName())
-    if not sn or sn == '' or sn == 'SA-MP' then return false end
+    if not sn or sn == '' or sn == 'SA-MP' then return false, false end
 
     nick = nick or waitForNickname(5000)
-    if not nick or nick == '' then return false end
+    if not nick or nick == '' then return false, false end
 
     local profileKey = sanitizeForPath(sn) .. '__' .. sanitizeForPath(nick)
 
@@ -2996,7 +3240,7 @@ local function checkAndSwitchProfile(sn, nick)
 
     if profileKey == activeProfileKey then
         utils.debugChat("{808080}[DEBUG] Профиль подтверждён: {FFFFFF}" .. tostring(activeProfileKey))
-        return false
+        return false, true
     end
 
     -- Сменился сервер и/или ник относительно активного профиля (например,
@@ -3011,7 +3255,7 @@ local function checkAndSwitchProfile(sn, nick)
         "{FFE133}. Перезагружаюсь...")
     wait(300)
     thisScript():reload()
-    return true
+    return true, true
 end
 
 function isProperlyConnected()
@@ -3060,13 +3304,26 @@ local function updateConnectionState()
         and not data.silentWindowOpen
         and not sampIsDialogActive() then
         data.connectionState.profileCheckPending = false
-        -- Если профиль сменился, checkAndSwitchProfile() уйдёт в reload().
-        checkAndSwitchProfile()
+        -- Если ник ещё не определился, оставляем проверку в очереди.
+        local _, resolved = checkAndSwitchProfile()
+        if not resolved then data.connectionState.profileCheckPending = true end
     end
 end
 
-function runTaskAndReopenDialog(taskFunction, ...)
+function runTaskAndReopenDialog(taskFunction, silent, ...)
+    -- FIX: раньше и для задач, запущенных игроком кнопкой, и для фоновых
+    -- задач (pendingScanBasementsHouses/pendingUpdateStatuses) эта функция
+    -- в конце одинаково слала /flashminer видимым способом. Для фоновых
+    -- задач это означало, что onShowDialog видел "чужой" (не тихий) диалог
+    -- и сам поднимал окно Mining Tools поверх игры, хотя игрок ничего не
+    -- открывал — окно потом оставалось висеть. Теперь фоновые вызовы
+    -- передают silent=true: таск помечается тихим (как withSilentFlashminer),
+    -- окно не поднимается, а после завершения диалог не переоткрывается
+    -- видимо для игрока.
+    if silent then taskState.setSilent(true) end
+
     taskFunction(...)
+
     lua_thread.create(function()
         while data.working do wait(50) end
         wait(200)
@@ -3078,8 +3335,11 @@ function runTaskAndReopenDialog(taskFunction, ...)
         if sampIsDialogActive() and isOwnScriptDialogId(sampGetCurrentDialogId()) then
             sampCloseCurrentDialogWithButton(0)
         end
+        if silent then taskState.setSilent(false) end
         if data.hasFlashminer == false then return end
-        sampSendChat("/flashminer")
+        if not silent then
+            sampSendChat("/flashminer")
+        end
     end)
 end
 
@@ -3088,14 +3348,14 @@ function setPendingHouseNumber(houseNumber)
     local n = tonumber(houseNumber)
     if not n then return end
     data.pendingHouseNumber = n
-    data.pendingHouseAt = os.clock()
+    data.pendingHouseAt = monotonicSeconds()
 end
 
 function getRecentFlashminerCurrentHouseNumber(maxAge)
     maxAge = maxAge or 120
     local n = tonumber(data.currentFlashminerHouseNumber)
     if not n then return nil end
-    if os.clock() - (data.currentFlashminerHouseAt or 0) > maxAge then return nil end
+    if monotonicSeconds() - (data.currentFlashminerHouseAt or 0) > maxAge then return nil end
     return n
 end
 
@@ -3116,7 +3376,7 @@ function resolveHouseNumberForCardDialog(title)
     if n then return n, 'title' end
 
     local pending = tonumber(data.pendingHouseNumber)
-    if pending and os.clock() - (data.pendingHouseAt or 0) <= 8 then
+    if pending and monotonicSeconds() - (data.pendingHouseAt or 0) <= 8 then
         data.pendingHouseNumber = nil
         return pending, 'pending'
     end
@@ -3160,6 +3420,10 @@ function main()
     -- === Проверка профиля (сервер + ник) ===
     -- Ждём ник локального игрока и считаем ключ профиля для текущей связки сервер+ник.
     local nick = waitForNickname(5000)
+    while not nick do
+        wait(1000)
+        nick = waitForNickname(5000)
+    end
     local skipWelcome = (cfg.isReloaded == true)
     utils.debugChat("{808080}[DEBUG] nickname = {FFFFFF}" .. tostring(nick))
 
@@ -3189,7 +3453,7 @@ function main()
         end
     end)
 
-    if cfg.checkForUpdates then
+    if AUTO_UPDATE_ENABLED and cfg.checkForUpdates then
         checkForUpdates()
     end
     if type(cfg.cardSnapshots) == 'table' then
@@ -3228,6 +3492,15 @@ function main()
         utils.addChat(cfg.active and "Скрипт {99ff99}включен." or "Скрипт {F78181}отключен.")
         save()
     end)
+    sampRegisterChatCommand('fixsizemnt', function()
+        data.mainWindowResetRequested = true
+        if data.showHouseControlWindow[0] then
+            utils.addChat("{99FF99}Положение и размер окна Mining Tools сброшены.")
+        else
+            utils.addChat("{99FF99}Положение и размер Mining Tools будут сброшены при следующем открытии окна.")
+        end
+    end)
+
     sampRegisterChatCommand('mntd', function()
         cfg.debug = not cfg.debug
         utils.addChat(cfg.debug and "Отладка {99ff99}включена." or "Отладка {F78181}отключена.")
@@ -3257,6 +3530,11 @@ function main()
         utils.addChat("{808080}url={FFFFFF}" .. tostring(UPDATE_CHECK_URL))
         utils.addChat("{808080}hasUpdate={FFFFFF}" .. tostring(updateState.hasUpdate) .. " latest={FFFFFF}" .. tostring(updateState.latestVersion))
     end)
+sampRegisterChatCommand('afk', function()
+    cfg.afkMode = not cfg.afkMode
+    save()
+    utils.addChat(cfg.afkMode and "AFK режим включен" or "AFK режим выключен")
+end)
 sampRegisterChatCommand('fls', function()
         if data.hasFlashminer == false then
             utils.addChat("{F78181}У вас нет флешки майнера.")
@@ -3293,6 +3571,10 @@ sampRegisterChatCommand('fls', function()
     end
 
     local escHandlers = {
+        {
+            cond = function() return data.main[0] and not data.working end,
+            act = function() closeCardControlWindow(true) end
+        },
         {
             cond = function() return data.showHelpWindow[0] end,
             act = function() data.showHelpWindow[0] = false end
@@ -3347,6 +3629,12 @@ sampRegisterChatCommand('fls', function()
                     return
                 end
             end
+        end
+
+        if data.main[0] and not data.working and (wparam == 9 or wparam == 13 or wparam == 38 or wparam == 40) then
+            -- TAB/ENTER/UP/DOWN must not control the SAMP dialog hidden behind mimgui.
+            consumeWindowMessage(true, false)
+            return
         end
 
         if data.main[0] and data.isFlashminer and not data.working then
@@ -3513,13 +3801,46 @@ sampRegisterChatCommand('fls', function()
             local now = os.time()
             collectTool.tickTriggers(now)
 
+            -- Отложенный запуск автосканирования новых домов / автообновления
+            -- статусов после первого открытия /flashminer. Выполняется только
+            -- здесь, в защищённом цикле (соединение стабильно, ничего другого
+            -- не выполняется, диалог не открыт), а не сразу из обработчика
+            -- диалога — чтобы не ловить краш клиента при реконнекте.
+            if not data.working and not data.silentWindowOpen and not sampIsDialogActive() then
+                if data.pendingScanBasementsHouses then
+                    local houses = data.pendingScanBasementsHouses
+                    data.pendingScanBasementsHouses = nil
+                    local task = buildTaskTable('scanBasements')
+                    runTaskAndReopenDialog(function() task:run(houses) end, true)
+                    goto continue_timer
+                elseif data.pendingUpdateStatuses then
+                    data.pendingUpdateStatuses = nil
+                    local task = buildTaskTable('updateStatuses')
+                    runTaskAndReopenDialog(function() task:run() end, true)
+                    goto continue_timer
+                end
+            end
+
+            -- FIX: autoRefreshTool.tickTimer раньше был ниже, вместе с
+            -- taxTool/autoTopUpTool, под общим гейтом "cfg.cheatModeEnabled"
+            -- (тумблер "Включить авто-функции"). Но автообновление статусов
+            -- домов управляется СВОИМ отдельным флагом (cfg.autoRefreshEnabled,
+            -- проверяется внутри самого tickTimer) и не должно зависеть от
+            -- того, включены ли автоналоги/автопополнение. Если пользователь
+            -- держит "авто-функции" выключенными, но включил автообновление
+            -- статусов — оно раньше вообще не срабатывало, и дома обновлялись
+            -- только вручную. Вынесено из-под гейта, оставлен только базовый
+            -- guard на data.working (сам tickTimer ничего не делает, если
+            -- диалог активен / идёт другая задача).
+            if not data.working then
+                autoRefreshTool.tickTimer(now)
+            end
+
             if not cfg.cheatModeEnabled or data.working then goto continue_timer end
 
             taxTool.tickTimer(now)
 
             autoTopUpTool.tickTimer(now)
-
-            autoRefreshTool.tickTimer(now)
 
             ::continue_timer::
         end
@@ -3531,9 +3852,10 @@ sampRegisterChatCommand('fls', function()
         data.lastWindowState.main = data.main[0]
         data.lastWindowState.houseControl = data.showHouseControlWindow[0]
         if cfg.active then
-            local id = sampGetCurrentDialogId()
-            local isVideocardListActive = (id == dialogIdTable.houseFlashMinerDialogId or id == dialogIdTable.videoCardSt) and
-                sampIsDialogActive() and not data.showHouseControlWindow[0] and not data.silentWindowOpen
+            local id = sampIsDialogActive() and sampGetCurrentDialogId() or nil
+            local isVideocardListActive = data.cardDialogSessionActive
+                and not data.showHouseControlWindow[0]
+                and not data.silentWindowOpen
             if waitingForDialogClose and not isVideocardListActive then
                 waitingForDialogClose = false
             end
@@ -3631,7 +3953,9 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
     button2 = button2 or ""
     utils.debugChat(string.format("[DIALOG] onShowDialog | id=%d style=%d | title=%q | btn1=%q btn2=%q | textLen=%d", dialogId, style, title, button1, button2, #(text or "")))
     if not cfg.active then return end
-
+    if cfg.afkMode then
+    utils.debugChat("[AFK] Диалог открыт: " .. tostring(title) .. " | ID: " .. tostring(dialogId) .. " | button2: " .. tostring(button2))
+end
     -- Автозакрытие неигровых информационных попапов (например, награда за
     -- сундук с рулеткой). Пока такое окно открыто на экране (например, вы
     -- AFK и некому нажать "понял"), sampIsDialogActive() держится в true
@@ -3650,7 +3974,24 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
             end
         end)
     end
-
+if cfg.afkMode and dialogId ~= data.dFlashminerId then
+    lua_thread.create(function()
+        wait(cfg.afkCloseDelay * 1000)
+        if sampIsDialogActive() and sampGetCurrentDialogId() == dialogId then
+            sampCloseCurrentDialogWithButton(0)
+            local logFile = io.open(getWorkingDirectory() .. "/config/Mining Tools/afk_log.txt", "a")
+            if logFile then
+                logFile:write("========== " .. os.date("%Y-%m-%d %H:%M:%S") .. " ==========\n")
+                logFile:write("Заголовок: " .. tostring(title) .. "\n")
+                logFile:write("ID: " .. tostring(dialogId) .. "\n")
+                logFile:write("Текст:\n" .. tostring(text) .. "\n")
+                logFile:write("========================================\n\n")
+                logFile:close()
+            end
+            utils.addChat("{FFE133}Закрыт диалог (AFK): " .. tostring(title))
+        end
+    end)
+end
     if title:find("Выбор дома") and text:find("циклов %(") then
         data.isFlashminer = true
     end
@@ -3677,20 +4018,20 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
         utils.addChat("{F78181}Нет свободных слотов на полке!")
         return false
     end
-    if data.fix and title:find("Игровое меню") then
-        sampSendDialogResponse(dialogId, 0, 0, "")
-        local closeTargetId = dialogId
-        lua_thread.create(function()
-            wait(0)
+    --if data.fix and title:find("Игровое меню") and not title:find("ВЫБОР МЕСТА СПАВНА") then
+        --sampSendDialogResponse(dialogId, 0, 0, "")
+        --local closeTargetId = dialogId
+        --lua_thread.create(function()
+            --wait(0)
             -- Закрываем только если на экране всё ещё именно этот диалог ("Игровое меню"),
             -- а не появившийся поверх него другой диалог (например, выбор видеокарты 25182).
             -- Иначе sampCloseCurrentDialogWithButton закроет не тот диалог, что надо, а тот, который сейчас на экране.
-            if sampIsDialogActive() and sampGetCurrentDialogId() == closeTargetId then
-                sampCloseCurrentDialogWithButton(0)
-            end
-        end)
-        return false
-    end
+            --if sampIsDialogActive() and sampGetCurrentDialogId() == closeTargetId then
+                --sampCloseCurrentDialogWithButton(0)
+            --end
+        --end)
+        --return false
+    --end
 
     taskState.refreshSuppressDialogs()
     local isMassAction = data.suppressDialogs and massActionTypes[data.taskTypeNow] and not cfg.useDialogMode == true
@@ -3752,18 +4093,29 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
                 return false
             end
         else
+            -- FIX: этот же dialogId (7238) сервер переиспользует и для
+            -- списка домов на пополнение баланса/оплату (houseListBankId).
+            -- Раньше здесь был безусловный `return` (= диалог показывается
+            -- как есть), из-за чего окно выбора дома для оплаты счёта
+            -- вылезало поверх игры даже во время фоновой/массовой операции
+            -- (autoTopUp/fixAllProblems), а игроку казалось, что это
+            -- "само" открылось окно /flashminer. Теперь во время тихого
+            -- режима или массовой автоматизации такой диалог скрываем —
+            -- ответ на него всё равно шлёт сама задача через sendResponse.
+            if isMassAction or data.silentWindowOpen then
+                return false
+            end
             return
         end
-
         if cfg.useDialogMode then
-            local newText = text .. "\n "
-            newText = newText .. "\n{33CC33}» Включить все видеокарты"
-            newText = newText .. "\n"
-            newText = newText .. "\n{FFFF00}» Собрать криптовалюту со всех домов"
-            newText = newText .. "\n"
-            newText = newText .. "\n{FF3333}» Выключить все видеокарты"
-            return { dialogId, style, title, button1, button2, newText, placeholder }
-        else
+    local newText = text .. "\n "
+    newText = newText .. "\n{33CC33}» Включить все видеокарты"
+    newText = newText .. "\n"
+    newText = newText .. "\n{FFFF00}» Собрать криптовалюту со всех домов"
+    newText = newText .. "\n"
+    newText = newText .. "\n{FF3333}» Выключить все видеокарты"
+    return { dialogId, style, title, button1, button2, newText, placeholder }
+else
             if isMassAction then
                 return false
             end
@@ -3803,7 +4155,14 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
             table.sort(houseNumbers)
             local currentHash = table.concat(houseNumbers, ",")
 
-            if not data.silentWindowOpen and not data.working and cfg.lastHouseListHash ~= currentHash then
+            if not data.silentWindowOpen and not data.working and cfg.lastHouseListHash ~= currentHash
+                and taskState.isAutomationAllowed() then
+                -- FIX: не трогаем кэш basementScanned/housesWithoutBasement, пока
+                -- соединение после реконнекта не признано стабильным — иначе
+                -- неполный (ещё не догрузившийся) список домов ошибочно
+                -- воспринимается как "дом пропал" и корректные пометки
+                -- "проверено" стираются, из-за чего дом снова показывается
+                -- как "Не проверено".
                 local newHouses = {}
                 for _, h in ipairs(data.dialogData.flashminer) do
                     local houseNum = tostring(h.house_number)
@@ -3832,15 +4191,25 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
                 save()
 
                 if #newHouses > 0 then
-                    local task = buildTaskTable('scanBasements')
-                    runTaskAndReopenDialog(function() task:run(newHouses) end)
+                    -- FIX (v2): предыдущая версия запускала task:run() сразу
+                    -- через lua_thread.create прямо из обработчика диалога —
+                    -- при реконнекте к серверу это могло начать слать ответы
+                    -- на диалоги раньше, чем соединение реально стабилизировалось,
+                    -- и роняло клиент. Теперь просто выставляем флаг, а сам
+                    -- запуск переносим в защищённый цикл (проверяет
+                    -- isAutomationAllowed(), т.е. что соединение стабильно и
+                    -- прошла задержка после реконнекта, плюс что ничего другого
+                    -- сейчас не выполняется).
+                    data.pendingScanBasementsHouses = newHouses
                     data.initialScanCompleted = true
                 end
             elseif not data.silentWindowOpen and not data.initialScanCompleted and not data.working then
                 cfg.lastHouseListHash = currentHash
                 save()
-                local task = buildTaskTable('updateStatuses')
-                runTaskAndReopenDialog(function() task:run() end)
+                -- FIX (v2): аналогично — откладываем автообновление статусов
+                -- до безопасного момента вместо немедленного запуска из
+                -- обработчика диалога.
+                data.pendingUpdateStatuses = true
                 data.initialScanCompleted = true
             end
 
@@ -3861,13 +4230,13 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
             -- мы всё ещё находимся в том же доме.
             setPendingHouseNumber(houseNum)
         end
-        data.forImgui = {
-            dTitle = houseNum and tostring(houseNum) or "Неизвестно",
-            allGood = true,
-            videocardCount = 0,
-            earnings = { btc = 0, asc = 0 },
-            attentionTime = 101,
-        }
+                data.forImgui = {
+    dTitle = data.isFlashminer and (houseNum and tostring(houseNum) or "Н/Д") or "",
+    allGood = true,
+    videocardCount = 0,
+    earnings = { btc = 0, asc = 0 },
+    attentionTime = 101,
+}
         data.dialogData.videocards = {}
         local listbox_index = -1
         for line in text:gmatch("[^\n\r]+") do
@@ -3875,16 +4244,14 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
             if line:find("{......}Работает") or line:find("{......}На паузе") then
                 local hasBtc = line:find("BTC") ~= nil
                 local hasAsc = line:find("ASC") ~= nil
-                local isRealAsic = line:find("ASIC") ~= nil
-                local btcFull = tonumber(line:match("([%d%.]+) BTC")) or 0
-                local ascFull = tonumber(line:match("([%d%.]+) ASC")) or 0
+                local isRealAsic = hasBtc and hasAsc
                 local card = {
                     index = listbox_index,
                     working = line:find("{......}Работает") and true or false,
-                    btc_full = btcFull,
-                    asc_full = ascFull,
-                    btc = math.floor(btcFull),
-                    asc = math.floor(ascFull),
+                    btc_full = tonumber(line:match("([%d%.]+) BTC")) or 0,
+                    asc_full = tonumber(line:match("([%d%.]+) ASC")) or 0,
+                    btc = math.floor(tonumber(line:match("([%d%.]+) BTC")) or 0),
+                    asc = math.floor(tonumber(line:match("([%d%.]+) ASC")) or 0),
                     coolant = tonumber(line:match("(%d+%.%d+)%%?%s*$")) or 0,
                     fluidType = hasBtc and 1 or (hasAsc and 2 or 0),
                     card_type = isRealAsic and "ASIC" or (hasBtc and "BTC" or "ASC"),
@@ -3900,7 +4267,13 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
             end
         end
 
-        if houseNum and not cfg.useDialogMode and not cfg.excludedHouses[tostring(houseNum)] then
+        -- FIX: раньше статус дома (updateHouseStatus) собирался только при
+        -- ВЫКЛЮЧЕННОМ режиме диалогов (not cfg.useDialogMode). При включённом
+        -- режиме диалогов lastCheck ни разу не проставлялся, и дом навсегда
+        -- оставался "Не проверено", сколько бы игрок в него ни заходил.
+        -- Сам SAMP-диалог в режиме диалогов по-прежнему остаётся видимым как
+        -- есть — теперь просто ПАРАЛЛЕЛЬНО с этим ещё и обновляется статус.
+        if houseNum and not cfg.excludedHouses[tostring(houseNum)] then
             local currentHouseData = nil
             for _, h in ipairs(data.dialogData.flashminer) do
                 if h.house_number == tonumber(houseNum) then
@@ -3917,12 +4290,27 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
             (isMassAction and dialogId ~= dialogIdTable.videoCardSt) then
             return false
         end
+
+        if not isMassAction and not data.silentWindowOpen then
+            data.cardDialogSessionActive = true
+            data.cardDialogId = dialogId
+            data.cardControlNeedsFocus = true
+            data.main[0] = true
+        end
+
+        -- User-selectable mode:
+        -- true  = do not render the original SAMP dialog at all;
+        -- false = keep it active behind the large opaque mimgui window.
+        if not isMassAction and not data.silentWindowOpen and cfg.hideCardSampDialog then
+            return false
+        end
     end
 
     if isMassAction then
         if dialogId == dialogIdTable.phoneBankMenuId or
             dialogId == dialogIdTable.topUpBalanceDialogId or
-            dialogId == dialogIdTable.payAllTaxesDialogId then
+            dialogId == dialogIdTable.payAllTaxesDialogId or
+            dialogId == dialogIdTable.houseListBankId then
             return false
         end
 
@@ -3946,11 +4334,10 @@ function sampev.onShowDialog(dialogId, style, title, button1, button2, text, pla
     -- СЃРµР№С‡Р°СЃ СЂРµР°Р»СЊРЅРѕ РІС‹РїРѕР»РЅСЏРµС‚СЃСЏ РјР°СЃСЃРѕРІР°СЏ Р·Р°РґР°С‡Р° (isMassAction) вЂ” РёРЅР°С‡Рµ
     -- СЃС‡РёС‚Р°РµРј, С‡С‚Рѕ РґРёР°Р»РѕРі РѕС‚РєСЂС‹С‚ РёРіСЂРѕРєРѕРј, Рё РЅРµ С‚СЂРѕРіР°РµРј РµРіРѕ.
     if isMassAction and dialogChecker:shouldHide(title, text) then
-        return false
     end
 
     -- Скрыть диалог видеокарт 1 сек после обновления статусов
-    if data.justFinishedUpdateAt and (os.clock() - data.justFinishedUpdateAt) < 1.0 then
+    if data.justFinishedUpdateAt and (monotonicSeconds() - data.justFinishedUpdateAt) < 1.0 then
         local cardDialogIds = {
             [dialogIdTable.videoCardSt]          = true,
             [dialogIdTable.videoCardDialogId]    = true,
@@ -3967,11 +4354,16 @@ function sampev.onDialogClose(dialogId, button, listitem, input)
     if dialogId == data.dFlashminerId then
         data.showHouseControlWindow[0] = false
     end
+    if dialogId == data.cardDialogId and not data.working then
+        data.cardDialogSessionActive = false
+        data.cardDialogId = nil
+        data.main[0] = false
+    end
     coolantTool.handleDialogClose(dialogId, button, listitem, input)
 end
 
 function sampev.onPlayerSpawn()
-    -- После релога (без полной перезагрузки скрипта) таблица data и os.clock()
+    -- После релога (без полной перезагрузки скрипта) таблица data и monotonicSeconds()
     -- не сбрасываются, поэтому pending/current-mark могут остаться от дома,
     -- открытого ДО релога, и резолвер выдаст неверный номер дома, пока
     -- игрок не откроет /flashminer заново. Сбрасываем это состояние на
@@ -3982,6 +4374,9 @@ function sampev.onPlayerSpawn()
     data.currentFlashminerHouseNumber = nil
     data.currentFlashminerHouseAt = 0
     data.lastSelectedHouse = -1
+    data.cardDialogSessionActive = false
+    data.cardDialogId = nil
+    data.main[0] = false
 end
 
 function sampev.onServerMessage(color, text)
@@ -4054,7 +4449,8 @@ function sampev.onServerMessage(color, text)
             return false
         elseif text:find("дом в котором хотите пополнить счёт") then
             return false
-        elseif text:find("Вы успешно пополнили счёт дома за") then
+        elseif text:find("Вы успешно пополнили счёт дома за") or text:find("Вы пополнили счёт дома за") then
+            data.topUpLastSucceeded = true
             return false
         end
     else
@@ -4290,13 +4686,16 @@ function updateHouseStatus(houseNumber, houseData)
         -- СЃРєР°С‡РѕРє РѕР±С‰РµР№ С‘РјРєРѕСЃС‚Рё. Р Р°РЅСЊС€Рµ С‚Р°РєР°СЏ СЂР°Р·РЅРёС†Р° РІСЃС‘ СЂР°РІРЅРѕ СЌРєСЃС‚СЂР°РїРѕР»РёСЂРѕРІР°Р»Р°СЃСЊ
         -- РЅР° СЃСѓС‚РєРё Рё РґР°РІР°Р»Р° "РґРѕС…РѕРґ СЃ РїРѕС‚РѕР»РєР°"; С‚РµРїРµСЂСЊ С‚Р°РєРѕРµ РЅР°Р±Р»СЋРґРµРЅРёРµ РїСЂРѕСЃС‚Рѕ
         -- РїСЂРѕРїСѓСЃРєР°РµС‚СЃСЏ, Р° РЅРµ РїРѕСЂС‚РёС‚ СЃС‚Р°С‚РёСЃС‚РёРєСѓ.
-        local compositionSum = 0
+        local compositionParts = {}
         for _, card in ipairs(data.dialogData.videocards) do
-            compositionSum = compositionSum + (card.level or 0)
+            table.insert(compositionParts, string.format("%s:%d:%d",
+                tostring(card.card_type or '?'), tonumber(card.level) or 0, tonumber(card.fluidType) or 0))
         end
-        local compositionSignature = totalCards .. ":" .. compositionSum
-        local compositionChanged = snapshot.lastComposition ~= nil
-            and snapshot.lastComposition ~= compositionSignature
+        table.sort(compositionParts)
+        local compositionSignature = table.concat(compositionParts, '|')
+        local previousComposition = snapshot.lastComposition
+        local compositionChanged = previousComposition ~= nil
+            and previousComposition ~= compositionSignature
         snapshot.lastComposition = compositionSignature
 
         if not snapshot.incomeObs then snapshot.incomeObs = {} end
@@ -4312,7 +4711,7 @@ function updateHouseStatus(houseNumber, houseData)
                 "[INCOME] House #%d: ASC/day bootstrap %.2f from ratio ASC/BTC %.4f",
                 houseNumber, snapshot.dailyAscRate, currentAscTotal / currentBtcTotal
             ))
-            local t = os.clock()
+            local t = monotonicSeconds()
             if t - _snapshotSaveT > 5.0 then
                 _snapshotSaveT = t
                 save()
@@ -4322,7 +4721,7 @@ function updateHouseStatus(houseNumber, houseData)
         if (snapshot.time or 0) > 0 and timeDiffMinutes >= MIN_INTERVAL and compositionChanged then
             utils.debugChat(string.format(
                 "[INCOME] Дом №%d: состав видеокарт изменился (%s -> %s), пропускаем замер скорости на этом цикле",
-                houseNumber, tostring(snapshot.lastComposition), compositionSignature
+                houseNumber, tostring(previousComposition), compositionSignature
             ))
         elseif (snapshot.time or 0) > 0 and timeDiffMinutes >= MIN_INTERVAL then
             -- BTC rate
@@ -4401,7 +4800,7 @@ function updateHouseStatus(houseNumber, houseData)
             snapshot.prevBtcTotal = currentBtcTotal
             snapshot.prevAscTotal = currentAscTotal
             snapshot.time = os.time()
-            local t = os.clock()
+            local t = monotonicSeconds()
             if t - _snapshotSaveT > 5.0 then
                 _snapshotSaveT = t
                 save()
@@ -4624,9 +5023,9 @@ function buildTaskTable(taskType, ...)
                 data.topUpLastFailed = false
                 data.taskTypeNow = taskType
                 data.stopAction = false
-                local startTime = os.clock()
+                local startTime = monotonicSeconds()
                 utils.debugChat(string.format("Задача '%s' запущена...", taskType))
-                action_count = (os.clock() - data.globalActionCounter.lastActionTime) > 3.0 and 0 or
+                action_count = (monotonicSeconds() - data.globalActionCounter.lastActionTime) > 3.0 and 0 or
                     data.globalActionCounter.count
 
                 local function sendResponse(...)
@@ -4700,17 +5099,17 @@ function buildTaskTable(taskType, ...)
                 end
                 data.stopBySystem = false
 
-                local duration = os.clock() - startTime
+                local duration = monotonicSeconds() - startTime
                 utils.debugChat(string.format("Задача '%s' завершена за %.2f сек.", taskType, duration))
                 data.globalActionCounter.count = action_count
-                data.globalActionCounter.lastActionTime = os.clock()
+                data.globalActionCounter.lastActionTime = monotonicSeconds()
 
                 progressTracker.reset()
                 wait(100)
                 taskState.setWorking(false)
                 if taskType == 'updateStatuses' then
                     imgui.addNotification('Обновлено')
-                    data.justFinishedUpdateAt = os.clock()
+                    data.justFinishedUpdateAt = monotonicSeconds()
                 end
                 data.taskTypeNow = nil
             end)
@@ -4945,13 +5344,13 @@ function buildTaskTable(taskType, ...)
         end
     elseif taskType == 'massSwitchCards' then
         task.run = function(self, enable)
-            local houses = {}
-            for _, h in ipairs(data.dialogData.flashminer) do table.insert(houses, h) end
-            if not houses or #houses == 0 then
-                utils.addChat("{F78181}Список домов не найден. Повторите попытку.")
-                return false
-            end
-
+    data.currentCollectHouse = ""
+    local houses = {}
+    for _, h in ipairs(data.dialogData.flashminer) do table.insert(houses, h) end
+    if not houses or #houses == 0 then
+        utils.addChat("{F78181}Список домов не найден. Повторите попытку.")
+        return false
+    end
             local housesToProcess = {}
             for _, house in ipairs(houses) do
                 if houseFilter.shouldProcess(house) then
@@ -4998,24 +5397,43 @@ function buildTaskTable(taskType, ...)
 
                 progressTracker.setTotal(#actualHousesToProcess)
 
-                for i, house in ipairs(actualHousesToProcess) do
+                                for i, house in ipairs(actualHousesToProcess) do
                     if data.stopAction then break end
+                    data.currentCollectHouse = (string.format("House #%d (%d/%d)", house.house_number, i, #actualHousesToProcess))
                     visitHouseCards(sendResponse, house, function(cards)
-                        local cardsToSwitch = 0
+                        local cardsWithProfit = {}
                         for _, card in ipairs(cards) do
-                            if (enable_arg and not card.working) or (not enable_arg and card.working) then
-                                cardsToSwitch = cardsToSwitch + 1
+                            if card.btc >= 1 or card.asc >= 1 then
+                                table.insert(cardsWithProfit, card)
                             end
                         end
-                        progressTracker.setHouseTotal(cardsToSwitch)
-                        for attempt = 1, 2 do
+                        if #cardsWithProfit > 0 then
+                            progressTracker.setHouseTotal(#cardsWithProfit)
+                            for _, profitCard in ipairs(cardsWithProfit) do
+                                if data.stopAction then break end
+                                dialogActions.selectCard(sendResponse, profitCard.index - 1)
+                                if profitCard.btc >= 1 then dialogActions.withdrawBTC(sendResponse) end
+                                if profitCard.asc >= 1 then dialogActions.withdrawASC(sendResponse) end
+                                if data.isRodina then
+                                    utils.pressButton(1024); wait(1000)
+                                    local t2 = 0
+                                    while not (sampIsDialogActive() and sampGetCurrentDialogId() == data.dFlashminerId) and t2 < 5000 do
+                                        wait(50); t2 = t2 + 50
+                                        if data.stopAction then break end
+                                    end
+                                else
+                                    dialogActions.closeDialog(sendResponse, dialogIdTable.videoCardDialogId)
+                                end
+                                progressTracker.increment(true)
+                            end
+                            wait(200)
+                        end
+                        if not data.stopAction then
                             local switchedCount = switchCardsInHouse(sendResponse, enable_arg)
-                            if switchedCount == 0 then break end
-                            if attempt == 1 then wait(500) end
+                            if switchedCount > 0 then wait(300) end
                         end
                     end)
                 end
-                wait(300)
 
                 local totalSwitched = 0
                 local housesActuallySwitched = 0
@@ -5049,7 +5467,6 @@ function buildTaskTable(taskType, ...)
         end
     elseif taskType == 'updateStatuses' then
         task.run = function(self)
-            local time = os.clock()
             local houses = {}
             for _, h in ipairs(data.dialogData.flashminer) do table.insert(houses, h) end
             if not houses or #houses == 0 then return false end
@@ -5067,8 +5484,19 @@ function buildTaskTable(taskType, ...)
                     if data.stopAction then break end
                     data.dialogData.videocards = {}
 
+                    -- FIX: раньше start_time для smart_wait брался ОДИН РАЗ до
+                    -- начала цикла по всем домам. Из-за этого уже со 2-го дома
+                    -- "прошедшее время" считалось от начала всей задачи, а не
+                    -- от выбора текущего дома, remaining_time_ms уходил в минус
+                    -- и smart_wait превращался в wait(0) — диалог закрывался
+                    -- раньше, чем приходил ответ сервера со списком видеокарт.
+                    -- Из-за этого houseNum/updateHouseStatus не успевали
+                    -- отработать, и дом навсегда оставался "Не проверено"
+                    -- (серым), сколько бы раз ни запускалось обновление.
+                    -- Теперь время отсчитывается заново для каждого дома.
+                    local start_time = monotonicSeconds()
                     dialogActions.selectHouse(sendResponse, house.index - 1)
-                    smart_wait(300, time)
+                    smart_wait(300, start_time)
                     dialogActions.closeDialog(sendResponse)
 
                     progressTracker.increment()
@@ -5104,8 +5532,8 @@ function buildTaskTable(taskType, ...)
 
                     dialogActions.selectHouse(sendResponse, house.index - 1)
 
-                    local start_time = os.clock()
-                    while os.clock() - start_time < 0.5 do
+                    local start_time = monotonicSeconds()
+                    while monotonicSeconds() - start_time < 0.5 do
                         wait(100)
                         if data.houseHasNoBasement then break end
                     end
@@ -5125,12 +5553,13 @@ function buildTaskTable(taskType, ...)
         end
     elseif taskType == 'fixAllProblems' then
         task.run = function(self)
-            local houses = {}
-            for _, h in ipairs(data.dialogData.flashminer) do table.insert(houses, h) end
-            if not houses or #houses == 0 then
-                utils.addChat("{F78181}Список домов не найден. Сначала обновите его.")
-                return false
-            end
+    data.currentCollectHouse = ""
+    local houses = {}
+    for _, h in ipairs(data.dialogData.flashminer) do table.insert(houses, h) end
+    if not houses or #houses == 0 then
+        utils.addChat("{F78181}Список домов не найден. Повторите попытку.")
+        return false
+    end
             local housesToProcess = {}
             for _, house in ipairs(houses) do
                 if houseFilter.shouldProcess(house) then
@@ -5158,7 +5587,7 @@ function buildTaskTable(taskType, ...)
                     houses_with_high_tax = {}
                 }
                 for _, house in ipairs(housesToProcess) do
-                    if house.balance < cfg.targetHouseBalance and (cfg.targetHouseBalance - house.balance) > 10000 then
+                    if house.balance < cfg.targetHouseBalance and (cfg.targetHouseBalance - house.balance) >= 10000 then
                         table.insert(summary.houses_to_top_up, house)
                     end
                 end
@@ -5271,14 +5700,21 @@ if not cfg.useSimpleTopUp then
                             end
 
                             data.topUpLastFailed = false
+                            data.topUpLastSucceeded = false
                             sendResponse(dialogIdTable.houseListBankId, 1, house.index - 1, "")
                             sendResponse(dialogIdTable.topUpBalanceDialogId, 1, 0, tostring(amount_this_transaction))
 
                             local confirmWait = 0
-                            while confirmWait < 600 do
+                            while confirmWait < 5000 do
                                 wait(50)
                                 confirmWait = confirmWait + 50
-                                if data.topUpLastFailed or data.stopAction then break end
+                                if data.topUpLastSucceeded or data.topUpLastFailed or data.stopAction then break end
+                            end
+                            if not data.topUpLastSucceeded and not data.topUpLastFailed and not data.stopAction then
+                                data.topUpLastFailed = true
+                                data.stopBySystem = true
+                                data.stopAction = true
+                                utils.addChat("{F78181}Сервер не подтвердил пополнение за 5 секунд. Операция остановлена.")
                             end
                             if data.topUpLastFailed or data.stopAction then
                                 break
@@ -5346,38 +5782,48 @@ if not cfg.useSimpleTopUp then
             end)
         end
     elseif taskType == 'autoPayTaxes' then
-        task.run = function(self)
-            createProtectedTask(function(sendResponse)
-                taxTool.resetCapturedAmount()
+    task.run = function(self)
+        createProtectedTask(function(sendResponse)
+            taxTool.resetCapturedAmount()
 
-                sampSendChat("/phone")
-                sendcef('launchedApp|24')
-                sampSendChat("/phone")
-                wait(500)
+            sampSendChat("/phone")
+            sendcef('launchedApp|24')
+            sampSendChat("/phone")
+            wait(500)
 
-                sendResponse(dialogIdTable.phoneBankMenuId, 1, 4, "")
-                wait(300)
+            sendResponse(dialogIdTable.phoneBankMenuId, 1, 4, "")
+            wait(300)
 
-                sendResponse(dialogIdTable.payAllTaxesDialogId, 1, 0, "")
-                wait(500)
+            sendResponse(dialogIdTable.payAllTaxesDialogId, 1, 0, "")
 
-                if sampIsDialogActive() then
-                    local activeId = sampGetCurrentDialogId()
-                    sendResponse(activeId, 0, 0, "")
-                end
+            local confirmWait = 0
+            while confirmWait < 10000 and not taxTool.isConfirmed() and not data.stopAction do
+                wait(100)
+                confirmWait = confirmWait + 100
+            end
 
+            if sampIsDialogActive() then
+                local activeId = sampGetCurrentDialogId()
+                sendResponse(activeId, 0, 0, "")
+            end
+
+            if taxTool.isConfirmed() then
                 cfg.lastTaxPayTime = os.time()
                 save()
-
                 local paid = taxTool.getCapturedAmount()
                 if paid > 0 then
-                    utils.addChat(string.format(
-                        "{BEF781}Налоги оплачены: {FFD700}$%s",
-                        utils.formatNumber(paid)))
+                    utils.addChat(string.format("{BEF781}Налоги оплачены: {FFD700}$%s", utils.formatNumber(paid)))
                     logsTool.add('tax', { amount = paid })
+                elseif taxTool.wasNothingToPay() then
+                    utils.debugChat("[TAX] Налогов к оплате нет.")
                 end
-            end)
-        end
+            elseif not data.stopAction then
+                cfg.lastTaxPayTime = os.time()
+                save()
+                utils.addChat("{FFE133}Налоги оплачены")
+            end
+        end)
+    end
     elseif taskType == 'autoTopUp' then
         task.run = function(self, housesToTopUp)
             if not housesToTopUp or #housesToTopUp == 0 then
@@ -5387,7 +5833,7 @@ if not cfg.useSimpleTopUp then
                         local threshold = cfg.autoTopUpByThreshold
                             and cfg.autoTopUpThreshold
                             or cfg.targetHouseBalance
-                        if house.balance < threshold and (threshold - house.balance) > 10000 then
+                        if house.balance < threshold and (threshold - house.balance) >= 10000 then
                             table.insert(housesToTopUp, house)
                         end
                     end
@@ -5395,6 +5841,8 @@ if not cfg.useSimpleTopUp then
             end
 
             if #housesToTopUp == 0 then
+                cfg.lastAutoTopUpTime = os.time()
+                save()
                 utils.addChat("{BEF781}Пополнение не требуется - балансы в норме.")
                 utils.debugChat("[CHEAT] top-up not needed.")
                 return false
@@ -5446,15 +5894,22 @@ if not cfg.useSimpleTopUp then
                         if amount < 10000 then break end
 
                         data.topUpLastFailed = false
+                        data.topUpLastSucceeded = false
                         sendResponse(dialogIdTable.houseListBankId, 1, house.index - 1, "")
                         sendResponse(dialogIdTable.topUpBalanceDialogId, 1, 0, tostring(amount))
 
-                        -- Count only after server had time to accept/reject
+                        -- Count the transaction only after an explicit server confirmation.
                         local confirmWait = 0
-                        while confirmWait < 600 do
+                        while confirmWait < 5000 do
                             wait(50)
                             confirmWait = confirmWait + 50
-                            if data.topUpLastFailed or data.stopAction then break end
+                            if data.topUpLastSucceeded or data.topUpLastFailed or data.stopAction then break end
+                        end
+                        if not data.topUpLastSucceeded and not data.topUpLastFailed and not data.stopAction then
+                            data.topUpLastFailed = true
+                            data.stopBySystem = true
+                            data.stopAction = true
+                            utils.addChat("{F78181}Сервер не подтвердил пополнение за 5 секунд. Операция остановлена.")
                         end
                         if data.topUpLastFailed or data.stopAction then
                             break
@@ -5477,8 +5932,10 @@ if not cfg.useSimpleTopUp then
                 end
                 wait(100)
 
-                cfg.lastAutoTopUpTime = os.time()
-                save()
+                if totalTopUp > 0 then
+                    cfg.lastAutoTopUpTime = os.time()
+                    save()
+                end
 
                 data.currentCollectHouse = ""
 
@@ -5501,25 +5958,28 @@ function withSilentFlashminer(callback)
     taskState.setSilent(true)
     if not flashminerTool.requestList(5000) then
         taskState.setSilent(false)
+        data.showHouseControlWindow[0] = restoreHouseControl
         return false
     end
 
-    local result = callback()
+    local ok, result = xpcall(callback, debug.traceback)
 
     wait(300)
-    -- FIX: СЂР°РЅСЊС€Рµ Р·РґРµСЃСЊ Р·Р°РєСЂС‹РІР°Р»СЃСЏ Р›Р®Р‘РћР™ РѕС‚РєСЂС‹С‚С‹Р№ РґРёР°Р»РѕРі Р±РµР· СЂР°Р·Р±РѕСЂР°, РёР·-Р·Р°
-    -- С‡РµРіРѕ С„РѕРЅРѕРІРѕРµ С‚РёС…РѕРµ РѕР±РЅРѕРІР»РµРЅРёРµ (РєР°Р¶РґС‹Рµ 5 РјРёРЅ / РїРѕ С‚Р°Р№РјРµСЂСѓ РЅР°Р»РѕРіРѕРІ Рё
-    -- РїРѕРїРѕР»РЅРµРЅРёСЏ) РјРѕРіР»Рѕ Р·Р°РєСЂС‹С‚СЊ РґРёР°Р»РѕРі, РєРѕС‚РѕСЂС‹Р№ РёРіСЂРѕРє РѕС‚РєСЂС‹Р» СЃР°Рј РІСЂСѓС‡РЅСѓСЋ
-    -- (РЅР°РїСЂРёРјРµСЂ, "РњРµР¶РґСѓРЅР°СЂРѕРґРЅС‹Рµ СЂРµР№СЃС‹", С‚РµР»РµС„РѕРЅ Рё С‚.Рї.). РўРµРїРµСЂСЊ Р·Р°РєСЂС‹РІР°РµРј
-    -- РїСЂРёРЅСѓРґРёС‚РµР»СЊРЅРѕ С‚РѕР»СЊРєРѕ РґРёР°Р»РѕРі СЃР°РјРѕРіРѕ СЃРєСЂРёРїС‚Р°; С‡СѓР¶РѕР№ РґРёР°Р»РѕРі РЅРµ С‚СЂРѕРіР°РµРј.
+    -- Close only dialogs owned by this script; never force-close the player's dialog.
     if sampIsDialogActive() and isOwnScriptDialogId(sampGetCurrentDialogId()) then
-        sampCloseCurrentDialogWithButton(0)
+        pcall(sampCloseCurrentDialogWithButton, 0)
         wait(300)
     end
-    fixI()
+    pcall(fixI)
     wait(300)
-    data.silentWindowOpen          = false
+    taskState.setSilent(false)
     data.showHouseControlWindow[0] = restoreHouseControl
+
+    if not ok then
+        utils.addChat("{F78181}Ошибка фоновой операции: " .. tostring(result))
+        print('[Mining Tools] Silent task error: ' .. tostring(result))
+        return false
+    end
     return result ~= false
 end
 
@@ -5535,13 +5995,15 @@ end
 
 imgui.OnInitialize(function()
     imgui.GetIO().IniFilename = nil
-    imgui.GetIO().MouseDrawCursor = true
-    imgui.GetStyle().MouseCursorScale = 1
+    imgui.GetIO().MouseDrawCursor = false
+    imgui.GetIO().FontGlobalScale = IS_MOBILE and 1.12 or 1.0
+    imgui.GetStyle().MouseCursorScale = IS_MOBILE and 1.25 or 1
     local config = imgui.ImFontConfig()
     config.MergeMode = true
     config.PixelSnapH = true
     local iconRanges = imgui.new.ImWchar[3](fa.min_range, fa.max_range, 0)
-    imgui.GetIO().Fonts:AddFontFromMemoryCompressedBase85TTF(fa.get_font_data_base85('solid'), 14, config, iconRanges)
+    imgui.GetIO().Fonts:AddFontFromMemoryCompressedBase85TTF(
+        fa.get_font_data_base85('solid'), IS_MOBILE and 18 or 14, config, iconRanges)
 end)
 
 function applyStyle()
@@ -5562,27 +6024,27 @@ function applyStyle()
         accentColorBuf[2] = cfg.accentColor[3]
     end
 
-    style.WindowPadding               = ImVec2(12, 12)
-    style.FramePadding                = ImVec2(8, 6)
-    style.ItemSpacing                 = ImVec2(8, 8)
-    style.ItemInnerSpacing            = ImVec2(6, 6)
-    style.TouchExtraPadding           = ImVec2(0, 0)
-    style.IndentSpacing               = 20.0
-    style.ScrollbarSize               = 10.0
-    style.GrabMinSize                 = 5.0
+    style.WindowPadding               = ImVec2(IS_MOBILE and 16 or 12, IS_MOBILE and 16 or 12)
+    style.FramePadding                = ImVec2(IS_MOBILE and 12 or 8, IS_MOBILE and 9 or 6)
+    style.ItemSpacing                 = ImVec2(IS_MOBILE and 10 or 8, IS_MOBILE and 10 or 8)
+    style.ItemInnerSpacing            = ImVec2(IS_MOBILE and 8 or 6, IS_MOBILE and 8 or 6)
+    style.TouchExtraPadding           = ImVec2(IS_MOBILE and 6 or 0, IS_MOBILE and 6 or 0)
+    style.IndentSpacing               = IS_MOBILE and 26.0 or 20.0
+    style.ScrollbarSize               = IS_MOBILE and 22.0 or 10.0
+    style.GrabMinSize                 = IS_MOBILE and 18.0 or 5.0
 
     style.WindowBorderSize            = 1
     style.ChildBorderSize             = 1
     style.PopupBorderSize             = 1
     style.FrameBorderSize             = 0
     style.TabBorderSize               = 1
-    style.WindowRounding              = 6.0
-    style.ChildRounding               = 6.0
-    style.FrameRounding               = 4.0
-    style.PopupRounding               = 5.0
-    style.ScrollbarRounding           = 9.0
-    style.GrabRounding                = 3.0
-    style.TabRounding                 = 5.0
+    style.WindowRounding              = IS_MOBILE and 12.0 or 6.0
+    style.ChildRounding               = IS_MOBILE and 10.0 or 6.0
+    style.FrameRounding               = IS_MOBILE and 8.0 or 4.0
+    style.PopupRounding               = IS_MOBILE and 10.0 or 5.0
+    style.ScrollbarRounding           = IS_MOBILE and 12.0 or 9.0
+    style.GrabRounding                = IS_MOBILE and 8.0 or 3.0
+    style.TabRounding                 = IS_MOBILE and 8.0 or 5.0
 
     style.WindowTitleAlign            = ImVec2(0.5, 0.5)
     style.ButtonTextAlign             = ImVec2(0.5, 0.5)
@@ -5768,7 +6230,7 @@ imgui.OnFrame(
             data.notifyWindow.isPreview = false
         end
 
-        local now           = os.clock()
+        local now           = monotonicSeconds()
         local dt            = _nLastT > 0 and math.min(now - _nLastT, 0.05) or 0.016
         _nLastT             = now
         local tgt           = data.notifyWindow.show[0] and 1.0 or 0.0
@@ -5819,7 +6281,7 @@ imgui.OnFrame(
                 if math.abs(nx - cfg.notifyWindowPosX) > 0.003 or
                     math.abs(ny - cfg.notifyWindowPosY) > 0.003 then
                     cfg.notifyWindowPosX, cfg.notifyWindowPosY = nx, ny
-                    local t = os.clock()
+                    local t = monotonicSeconds()
                     if t - _nSaveT > 1.5 then
                         _nSaveT = t; save()
                     end
@@ -5935,16 +6397,22 @@ imgui.OnFrame(
     function(self)
         applyStyle()
         local sw, sh = getScreenResolution()
-        imgui.SetNextWindowSizeConstraints(imgui.ImVec2(560, 100), imgui.ImVec2(560, sh - 40))
-        imgui.SetNextWindowPos(
-            imgui.ImVec2(sw / 2, sh / 2),
-            imgui.Cond.FirstUseEver,
-            imgui.ImVec2(0.5, 0.5)
-        )
+        if IS_MOBILE then
+            imgui.SetNextWindowSize(imgui.ImVec2(math.floor(sw * 0.90), math.floor(sh * 0.84)), imgui.Cond.Always)
+            imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+        else
+            imgui.SetNextWindowSizeConstraints(imgui.ImVec2(560, 100), imgui.ImVec2(560, sh - 40))
+            imgui.SetNextWindowPos(
+                imgui.ImVec2(sw / 2, sh / 2),
+                imgui.Cond.FirstUseEver,
+                imgui.ImVec2(0.5, 0.5)
+            )
+        end
 
-        if imgui.Begin("##helpWin", data.showHelpWindow,
-                imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar +
-                imgui.WindowFlags.NoResize + imgui.WindowFlags.NoScrollbar + 64) then
+        local helpFlags = imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar +
+            imgui.WindowFlags.NoResize + 64
+        if not IS_MOBILE then helpFlags = helpFlags + imgui.WindowFlags.NoScrollbar end
+        if imgui.Begin("##helpWin", data.showHelpWindow, helpFlags) then
             local imStyle     = imgui.GetStyle()
             local winW        = imgui.GetWindowWidth()
 
@@ -5960,7 +6428,7 @@ imgui.OnFrame(
             imgui.TextColoredRGB("{FFFFFF}" .. titleStr)
 
             imgui.SetCursorPos(imgui.ImVec2(winW - 50 - imStyle.ItemSpacing.x, imStyle.ItemSpacing.y))
-            if imgui.Button(fa.XMARK .. "##helpClose", imgui.ImVec2(40, 22)) then
+            if imgui.Button(fa.XMARK .. "##helpClose", imgui.ImVec2(IS_MOBILE and 52 or 40, IS_MOBILE and 38 or 22)) then
                 data.showHelpWindow[0] = false
             end
             imgui.Hint("Закрыть справку")
@@ -5974,7 +6442,7 @@ imgui.OnFrame(
             end
 
             imgui.Spacing()
-            if imgui.Button((isSetup and "Завершить настройку" or "Понятно, закрыть"), imgui.ImVec2(-1, 30)) then
+            if imgui.Button((isSetup and "Завершить настройку" or "Понятно, закрыть"), imgui.ImVec2(-1, IS_MOBILE and 46 or 30)) then
                 data.showHelpWindow[0] = false
             end
 
@@ -5989,16 +6457,22 @@ imgui.OnFrame(
     function(self)
         applyStyle()
         local sw, sh = getScreenResolution()
-        imgui.SetNextWindowSizeConstraints(imgui.ImVec2(420, 50), imgui.ImVec2(420, sh - 40))
-        imgui.SetNextWindowPos(
-            imgui.ImVec2(sw / 2 + 520, sh / 2),
-            imgui.Cond.FirstUseEver,
-            imgui.ImVec2(0.5, 0.5)
-        )
+        if IS_MOBILE then
+            imgui.SetNextWindowSize(imgui.ImVec2(math.floor(sw * 0.90), math.floor(sh * 0.84)), imgui.Cond.Always)
+            imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+        else
+            imgui.SetNextWindowSizeConstraints(imgui.ImVec2(420, 50), imgui.ImVec2(420, sh - 40))
+            imgui.SetNextWindowPos(
+                imgui.ImVec2(sw / 2 + 520, sh / 2),
+                imgui.Cond.FirstUseEver,
+                imgui.ImVec2(0.5, 0.5)
+            )
+        end
 
-        if imgui.Begin("##settingsWin", data.showSettingsWindow,
-                imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar +
-                imgui.WindowFlags.NoResize + imgui.WindowFlags.NoScrollbar + 64) then
+        local settingsFlags = imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar +
+            imgui.WindowFlags.NoResize + 64
+        if not IS_MOBILE then settingsFlags = settingsFlags + imgui.WindowFlags.NoScrollbar end
+        if imgui.Begin("##settingsWin", data.showSettingsWindow, settingsFlags) then
             local imStyle = imgui.GetStyle()
             local winW = imgui.GetWindowWidth()
 
@@ -6013,7 +6487,7 @@ imgui.OnFrame(
             imgui.TextColoredRGB("{FFFFFF}Настройки")
 
             imgui.SetCursorPos(imgui.ImVec2(winW - 50 - imStyle.ItemSpacing.x, imStyle.ItemSpacing.y))
-            if imgui.Button(fa.XMARK .. "##settClose", imgui.ImVec2(40, 22)) then
+            if imgui.Button(fa.XMARK .. "##settClose", imgui.ImVec2(IS_MOBILE and 52 or 40, IS_MOBILE and 38 or 22)) then
                 data.showSettingsWindow[0] = false
             end
             imgui.Hint("Закрыть настройки")
@@ -6061,21 +6535,38 @@ imgui.OnFrame(
                     end
                     imgui.Hint("Отключает все сообщения скрипта в чат.")
 
-                    if imgui.Checkbox("Старый вид (диалог SAMP)", imcfg.useDialogMode) then
-                        cfg.useDialogMode = imcfg.useDialogMode[0]; save()
-                        if cfg.useDialogMode then
-                            sampSendChat('/flashminer')
-                            data.showLogsWindow[0] = false
-                            data.showSettingsWindow[0] = false
-                        end
+                    -- Старый вид (диалог SAMP) - удалено
+                    if imgui.Checkbox("Полностью скрывать диалог видеокарт SAMP", imcfg.hideCardSampDialog) then
+                        cfg.hideCardSampDialog = imcfg.hideCardSampDialog[0]
+                        save()
+                        imgui.addNotification("Режим применится при следующем открытии видеокарт")
                     end
-                    imgui.Hint("Добавляет пункты в стандартный диалог SAMP вместо отдельного окна.")
+                    imgui.Hint("Включено: стандартный диалог не отображается.\n" ..
+                        "Выключено: он остаётся активным, но полностью закрыт большим окном Mining Tools.")
+                        if imgui.Checkbox("Режим AFK", imcfg.afkMode) then
+                        cfg.afkMode = imcfg.afkMode[0]
+                        save()
+                    end
+                    imgui.Hint("Автоматически закрывать диалоги через заданное время")
+                    if cfg.afkMode then
+                    imgui.PushItemWidth(-1)
+                    if imgui.SliderInt("##afkDelay", imcfg.afkCloseDelay, 10, 120, "%d сек") then
+                        cfg.afkCloseDelay = imcfg.afkCloseDelay[0]
+                        save()
+                    end
+                    imgui.PopItemWidth()
+                    end
 
                     imgui.Spacing()
                     imgui.Separator()
                     imgui.Spacing()
 
-                    if UPDATE_CHECK_URL ~= nil then
+                    if not AUTO_UPDATE_ENABLED then
+                        imgui.TextDisabled("Автообновление временно отключено в этой сборке.")
+                        imgui.Spacing()
+                        imgui.Separator()
+                        imgui.Spacing()
+                    elseif UPDATE_CHECK_URL ~= nil then
                         if imgui.Checkbox("Проверять обновления при запуске", imcfg.checkForUpdates) then
                             cfg.checkForUpdates = imcfg.checkForUpdates[0]; save()
                         end
@@ -6106,7 +6597,7 @@ imgui.OnFrame(
                     end
                     if imgui.Selectable("Сбросить статистику дохода", false) then
                         data.statsResetConfirm = true
-                        data.statsResetTimer   = os.clock()
+                        data.statsResetTimer   = monotonicSeconds()
                     end
 
                     imgui.Spacing()
@@ -6118,7 +6609,7 @@ imgui.OnFrame(
                     end
                     if imgui.Selectable("Сбросить все настройки", false) then
                         data.settingsResetConfirm = true
-                        data.settingsResetTimer   = os.clock()
+                        data.settingsResetTimer   = monotonicSeconds()
                     end
                     imgui.Spacing()
                     imgui.TextDisabled(("v" .. script.this.version))
@@ -7228,7 +7719,7 @@ imgui.OnFrame(
             local nx, ny = wp.x / sw, wp.y / sh
             if math.abs(nx - cfg.logsWindowPosX) > 0.003 or math.abs(ny - cfg.logsWindowPosY) > 0.003 then
                 cfg.logsWindowPosX, cfg.logsWindowPosY = nx, ny
-                local t = os.clock()
+                local t = monotonicSeconds()
                 if t - _logsSaveT > 1.5 then
                     _logsSaveT = t; save()
                 end
@@ -7243,7 +7734,7 @@ imgui.OnFrame(
             imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.25, 0.07, 0.07, 1))
             if imgui.Button(fa.TRASH .. "##logsReset", imgui.ImVec2(40, 22)) then
                 data.logsResetConfirm = true
-                data.logsResetTimer   = os.clock()
+                data.logsResetTimer   = monotonicSeconds()
             end
             imgui.PopStyleColor(3)
             imgui.Hint("Очистить все логи действий")
@@ -7583,185 +8074,301 @@ imgui.OnFrame(
     end
 )
 
--- при заходе на ферму
--- Управление курсором ImGui: рисовать только когда открыто хотя бы одно окно скрипта,
--- чтобы избежать мерцания/двоения курсора с курсором SAMP/игры.
+-- Большое окно управления видеокартами.
+-- Оно заменяет прежнюю маленькую панель справа и визуально повторяет окно /flashminer.
+local function cardControlSummaryBox(id, icon, label, value, valueColor, width)
+    imgui.PushStyleColor(imgui.Col.ChildBg, accentTint(0.09, 0.11, 0.16, 0.28, 1))
+    imgui.BeginChild(id, imgui.ImVec2(width, 66), true,
+        imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
+    imgui.SetCursorPos(imgui.ImVec2(10, 8))
+    imgui.TextColoredRGB('{BFCBE0}' .. icon .. '  ' .. label)
+    imgui.SetCursorPos(imgui.ImVec2(10, 34))
+    imgui.TextColoredRGB((valueColor or '{FFFFFF}') .. tostring(value))
+    imgui.EndChild()
+    imgui.PopStyleColor()
+end
+
+local function renderVideocardControlRow(card, index)
+    local threshold = tonumber(cfg.useCoolantPercent) or 50
+    local needsAttention = (not card.working) or (card.coolant < threshold)
+    local rowTint = needsAttention
+        and imgui.ImVec4(0.22, 0.08, 0.10, 0.98)
+        or accentTint(0.09, 0.11, 0.16, 0.28, 1)
+
+    imgui.PushStyleColor(imgui.Col.ChildBg, rowTint)
+    imgui.BeginChild('##videocard_row_' .. tostring(index), imgui.ImVec2(0, 94), true,
+        imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
+
+    imgui.SetCursorPos(imgui.ImVec2(12, 9))
+    imgui.TextColoredRGB(string.format('{FFFFFF}%s №%d',
+        card.card_type == 'ASIC' and 'ASIC' or 'Видеокарта', index))
+    imgui.SameLine(0, 8)
+    imgui.TextColoredRGB(card.working and '{BEF781}Работает' or '{F78181}На паузе')
+
+    imgui.SetCursorPos(imgui.ImVec2(12, 33))
+    imgui.TextColoredRGB(string.format('{BFCBE0}Тип: {FFFFFF}%s  {808080}|  {BFCBE0}Уровень: {FFFFFF}%d',
+        tostring(card.card_type or 'Н/Д'), tonumber(card.level) or 0))
+
+    imgui.SetCursorPos(imgui.ImVec2(12, 55))
+    local profit = ""
+if card.card_type == "ASIC" then
+    profit = string.format('{D2691E}%.6f BTC  {808080}|  {C0392B}%.6f ASC', 
+        tonumber(card.btc_full) or 0, 
+        tonumber(card.asc_full) or 0)
+elseif card.fluidType == 1 then
+    profit = string.format('{D2691E}%.6f BTC', tonumber(card.btc_full) or 0)
+else
+    profit = string.format('{C0392B}%.6f ASC', tonumber(card.asc_full) or 0)
+end
+imgui.TextColoredRGB(profit)
+
+    local barWidth = math.max(180, imgui.GetContentRegionAvail().x - 18)
+    imgui.SetCursorPos(imgui.ImVec2(12, 76))
+    local coolant = math.max(0, math.min(100, tonumber(card.coolant) or 0))
+    local barColor
+    if coolant < threshold then
+        barColor = imgui.ImVec4(1.0, 0.20, 0.20, 1.0)
+    elseif coolant < threshold + (100 - threshold) / 2 then
+        barColor = imgui.ImVec4(1.0, 0.82, 0.20, 1.0)
+    else
+        barColor = imgui.ImVec4(0.30, 0.80, 1.0, 1.0)
+    end
+    imgui.PushStyleColor(imgui.Col.PlotHistogram, barColor)
+    imgui.PushStyleColor(imgui.Col.FrameBg, imgui.ImVec4(0.12, 0.13, 0.16, 1.0))
+    imgui.ProgressBar(coolant / 100.0, imgui.ImVec2(barWidth, 13), string.format('%.1f%%', coolant))
+    imgui.PopStyleColor(2)
+
+    imgui.EndChild()
+    imgui.PopStyleColor()
+end
 imgui.OnFrame(function() return data.main[0] end, function(self)
-    applyCustomStyle()
-    local w, h = getScreenResolution()
-    local windowSize = imgui.ImVec2(480.0, 323.0)
-    local margin_right = 0.0
-    local y_percent_top = 0.40
+    applyStyle()
 
-    local posX = w - windowSize.x - margin_right
-    local posY = h * y_percent_top
+    local sw, sh = getScreenResolution()
+    local windowWidth = math.max(520, math.min(1000, sw - 40))
+    local windowHeight = math.max(460, math.min(680, sh - 40))
+    imgui.SetNextWindowSize(imgui.ImVec2(windowWidth, windowHeight), imgui.Cond.Always)
+    imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.Always, imgui.ImVec2(0.5, 0.5))
+    if data.cardControlNeedsFocus then
+        imgui.SetNextWindowFocus()
+        data.cardControlNeedsFocus = false
+    end
 
-    posX = math.max(0, math.min(posX, w - windowSize.x))
-    posY = math.max(0, math.min(posY, h - windowSize.y))
+    local flags = imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar +
+        imgui.WindowFlags.NoResize + imgui.WindowFlags.NoMove
 
-    imgui.SetNextWindowSize(windowSize, imgui.Cond.Always)
-    imgui.SetNextWindowPos(imgui.ImVec2(posX, posY), imgui.Cond.Always)
-
-    if imgui.Begin("##main_windos", data.main, imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoScrollbar +
-            imgui.WindowFlags.NoResize + imgui.WindowFlags.NoTitleBar +
-            imgui.WindowFlags.NoMove) then
+    if imgui.Begin('Mining Tools##CardControlLarge', data.main, flags) then
+        local wasOpen = data.main[0]
         imgui.customTitleBar(data.main, resetDefaultCfg, imgui.GetWindowWidth())
+        if wasOpen and not data.main[0] then
+            imgui.End()
+            closeCardControlWindow(true)
+            return
+        end
 
-        __i__main()
+        local style = imgui.GetStyle()
+        local innerWidth = imgui.GetContentRegionAvail().x
+        local gap = style.ItemSpacing.x
+        local summaryWidth = (innerWidth - gap * 3) / 4
+        local minCoolant = tonumber(data.forImgui.attentionTime) or 0
+        if minCoolant > 100 then minCoolant = 0 end
+
+        local blocks = {}
+local blockCount = 0
+
+if data.isFlashminer then
+    table.insert(blocks, { id = 'house', icon = fa.HOUSE, label = 'Дом', value = '№' .. tostring(data.forImgui.dTitle or 'Н/Д'), color = '{FFFFFF}' })
+end
+table.insert(blocks, { id = 'cards', icon = fa.MICROCHIP, label = 'Видеокарты', value = tostring(data.forImgui.videocardCount or 0) .. ' шт.', color = '{BEF781}' })
+local btcAmount = tonumber(data.forImgui.earnings.btc) or 0
+local ascAmount = tonumber(data.forImgui.earnings.asc) or 0
+local incomeText = string.format('{D2691E}%d BTC', btcAmount)
+if not data.isRodina then
+    incomeText = incomeText .. string.format(' {FFFFFF}|  {C0392B}%d ASC', ascAmount)
+end
+table.insert(blocks, { id = 'income', icon = fa.COINS, label = 'Можно снять', value = incomeText, color = '{D2691E}' })
+table.insert(blocks, { id = 'status', icon = fa.CIRCLE_CHECK, label = 'Состояние', value = data.forImgui.allGood and 'Всё хорошо' or 'Требует внимания', color = data.forImgui.allGood and '{BEF781}' or '{F78181}' })
+
+local totalWidth = 0
+for _, b in ipairs(blocks) do
+    totalWidth = totalWidth + summaryWidth
+end
+totalWidth = totalWidth + (blockCount - 1) * gap
+
+local startX = (innerWidth - totalWidth) / 2
+local cursorX = startX
+
+for i, b in ipairs(blocks) do
+    if i > 1 then imgui.SameLine(0, gap) end
+    if i == 1 then
+        imgui.SetCursorPosX(cursorX)
+    end
+    cardControlSummaryBox('##cc_' .. b.id, b.icon, b.label, b.value, b.color, summaryWidth)
+    cursorX = cursorX + summaryWidth + gap
+end
+        imgui.Spacing()
+
+        imgui.PushStyleColor(imgui.Col.ChildBg, accentTint(0.09, 0.11, 0.16, 0.25, 1))
+        imgui.BeginChild('##cc_navigation', imgui.ImVec2(0, 48), true,
+            imgui.WindowFlags.NoScrollbar + imgui.WindowFlags.NoScrollWithMouse)
+        local navWidth = 120
+        if ButtonWithHint(fa.ARROW_LEFT .. '  Назад##cc_prev', 'Предыдущая ферма',
+                data.isFlashminer and not data.working, imgui.ImVec2(navWidth, 30)) then
+            flashminerTool.navigate(-1)
+        end
+        imgui.SameLine()
+        local centerText = data.isFlashminer
+            and ('Управление фермой дома №' .. tostring(data.forImgui.dTitle or 'Н/Д'))
+            or 'Управление видеокартами'
+        local centerX = (imgui.GetWindowWidth() - imgui.CalcTextSize(centerText).x) / 2
+        imgui.SetCursorPosX(math.max(imgui.GetCursorPosX(), centerX))
+        imgui.SetCursorPosY(16)
+        imgui.TextColoredRGB('{FFFFFF}' .. centerText)
+        imgui.SameLine()
+        imgui.SetCursorPosX(imgui.GetWindowWidth() - navWidth - style.WindowPadding.x)
+        imgui.SetCursorPosY(9)
+        if ButtonWithHint('Вперёд  ' .. fa.ARROW_RIGHT .. '##cc_next', 'Следующая ферма',
+                data.isFlashminer and not data.working, imgui.ImVec2(navWidth, 30)) then
+            flashminerTool.navigate(1)
+        end
+        imgui.EndChild()
+        imgui.PopStyleColor()
+
+        imgui.Spacing()
+
+        local contentHeight = imgui.GetContentRegionAvail().y
+        local leftWidth = math.floor(innerWidth * 0.62)
+        imgui.PushStyleColor(imgui.Col.ChildBg, accentTint(0.07, 0.08, 0.11, 0.20, 1))
+        if imgui.BeginChild('##cc_cards_list', imgui.ImVec2(leftWidth, contentHeight), true,
+                imgui.WindowFlags.NoScrollWithMouse) then
+            imgui.TextColoredRGB('{FFFFFF}' .. fa.MICROCHIP .. '  Список видеокарт')
+            imgui.Separator()
+            if #data.dialogData.videocards == 0 then
+                imgui.Spacing()
+                imgui.TextDisabled('Нет данных о видеокартах.')
+            else
+                imgui.Scroller('card_control_cards', 34, 300,
+                    imgui.HoveredFlags.RectOnly + imgui.HoveredFlags.ChildWindows)
+                for i, card in ipairs(data.dialogData.videocards) do
+                    renderVideocardControlRow(card, i)
+                    if i < #data.dialogData.videocards then imgui.Spacing() end
+                end
+            end
+            imgui.EndChild()
+        end
+        imgui.PopStyleColor()
+
+        imgui.SameLine(0, gap)
+
+        imgui.PushStyleColor(imgui.Col.ChildBg, accentTint(0.07, 0.08, 0.11, 0.20, 1))
+        if imgui.BeginChild('##cc_actions', imgui.ImVec2(0, contentHeight), true,
+                imgui.WindowFlags.NoScrollbar) then
+            imgui.TextColoredRGB('{FFFFFF}' .. fa.BARS .. '  Управление')
+            imgui.Separator()
+            imgui.Spacing()
+                imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0.2, 0.5, 0.8, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.3, 0.6, 0.9, 1.0))
+    imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.1, 0.4, 0.7, 1.0))
+    if imgui.Button(fa.ARROW_UP_RIGHT_FROM_SQUARE .. " Open SAMP", imgui.ImVec2(-1, 38)) then
+    lua_thread.create(function()
+        data.showHouseControlWindow[0] = false
+        data.cardDialogSessionActive = false
+        data.cardDialogId = nil
+        data.main[0] = false
+        wait(50)
+        if #data.dialogData.videocards > 0 then
+            sampSendDialogResponse(dialogIdTable.videoCardDialogId, 1, 0, "")
+        end
+    end)
+end
+if imgui.IsItemHovered() then
+    imgui.SetTooltip("Открыть стандартный SAMP диалог выбора видеокарты\nОкно скрипта закроется автоматически\nОбязательно перед использованием отключить режим (Полностью скрывать диалог видеокарт SAMP)")
+end
+imgui.PopStyleColor(3)
+imgui.Spacing()
+imgui.Separator()
+imgui.Spacing()
+
+            local buttonHeight = 38
+            local canWithdraw = (tonumber(data.forImgui.earnings.btc) or 0) >= 1 or
+                (tonumber(data.forImgui.earnings.asc) or 0) >= 1
+            if ButtonWithHint('Снять криптовалюту',
+                    canWithdraw and 'Снять всю доступную криптовалюту' or 'Нет криптовалюты для снятия',
+                    canWithdraw and not data.working, imgui.ImVec2(-1, buttonHeight)) then
+                coolantTool.resetSupplyFlag()
+                local task = buildTaskTable('takeCrypto')
+                task:takeCrypto()
+            end
+
+            if ButtonWithHint('Включить все видеокарты', 'Включить все доступные видеокарты',
+                    not data.working, imgui.ImVec2(-1, buttonHeight)) then
+                local task = buildTaskTable('switchCards')
+                task:switchCards(true)
+            end
+
+            if ButtonWithHint('Выключить все видеокарты', 'Выключить все работающие видеокарты',
+                    not data.working, imgui.ImVec2(-1, buttonHeight)) then
+                local task = buildTaskTable('switchCards')
+                task:switchCards(false)
+            end
+
+            local canRefill = not data.isFlashminer and not data.working
+            if ButtonWithHint('Залить охлаждающую жидкость',
+                    data.isFlashminer and 'Недоступно в флешке майнера' or 'Залить жидкость во все карты ниже порога',
+                    canRefill, imgui.ImVec2(-1, buttonHeight)) then
+                local task = buildTaskTable('coolant')
+                task:coolant()
+            end
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+            imgui.TextColoredRGB('{BFCBE0}Настройки заливки')
+
+            if imgui.Checkbox('Супер охлаждающая жидкость##cc_super', imcfg.useSuperCoolant) then
+                cfg.useSuperCoolant = imcfg.useSuperCoolant[0]
+                save()
+            end
+            imgui.Hint('Использовать супер охлаждающую жидкость вместо обычной.')
+
+            if imgui.Checkbox('Режим экономии##cc_economy', imcfg.economyMode) then
+                cfg.economyMode = imcfg.economyMode[0]
+                save()
+            end
+            imgui.Hint('При возможности не расходовать вторую обычную жидкость.')
+
+            imgui.Text('Порог автоматической заливки:')
+            imgui.PushItemWidth(-1)
+            if imgui.SliderInt('##cc_coolant_threshold', imcfg.useCoolantPercent, 1, 100, '%d%%') then
+                cfg.useCoolantPercent = imcfg.useCoolantPercent[0]
+                save()
+            end
+            imgui.PopItemWidth()
+
+            imgui.Spacing()
+            imgui.Separator()
+            imgui.Spacing()
+
+            if imgui.Checkbox('Полностью скрывать диалог SAMP##cc_hide_samp', imcfg.hideCardSampDialog) then
+                cfg.hideCardSampDialog = imcfg.hideCardSampDialog[0]
+                save()
+                imgui.addNotification('Режим применится при следующем открытии')
+            end
+            imgui.Hint('Выключено: стандартный диалог остаётся активным за этим окном.\n' ..
+                'Включено: стандартный диалог вообще не отображается.')
+
+            imgui.TextDisabled(cfg.hideCardSampDialog
+                and 'Текущий режим: диалог SAMP скрывается'
+                or 'Текущий режим: диалог SAMP находится за окном')
+
+            imgui.EndChild()
+        end
+        imgui.PopStyleColor()
+
         imgui.showNotifications(2)
         imgui.End()
     end
 end)
-
-function __i__main()
-    imgui.BeginChild('##top_panel_unified', imgui.ImVec2(0, 104), true, imgui.WindowFlags.NoScrollbar)
-    imgui.Columns(2, "##main_columns_unified", false, imgui.WindowFlags.NoScrollbar)
-    imgui.SetColumnWidth(0, 255)
-    -- Левая колонка с информацией
-    __i__infoPanel()
-    imgui.NextColumn()
-    -- Правая колонка с кнопками управления
-    __i__controlPanel()
-
-    imgui.Columns(1)
-    imgui.EndChild()
-
-    -- Нижняя панель
-    __i__bottomPanel()
-end
-
-function __i__infoPanel()
-    imgui.BeginChild('##info_panel_child', imgui.ImVec2(0, -1), false, imgui.WindowFlags.NoScrollbar)
-    local title_text = data.forImgui.dTitle or "Ожидание..."
-    -- imgui.TextColoredRGB('{ffffff}Дом: {ffa500}№ ' .. title_text)
-    imgui.TextColoredRGB('{ffffff}Статус фермы: ' ..
-        (data.forImgui.allGood and '{BEF781}Всё хорошо.' or '{F78181}Требует внимания.'))
-    imgui.TextColoredRGB('{ffffff}Количество видеокарт: {99ff99}' .. data.forImgui.videocardCount)
-    imgui.TextColoredRGB('{ffffff}Можно снять: {D2691E}' ..
-        data.forImgui.earnings.btc .. ' BTC' ..
-        (not data.isRodina and ' {ffffff}|| {c0392b}' .. data.forImgui.earnings.asc .. ' ASC' or ''))
-    imgui.EndChild()
-end
-
-function __i__controlPanel()
-    local availableWidth = imgui.GetContentRegionAvail().x
-    local buttonSide = ((availableWidth - imgui.GetStyle().ItemSpacing.x) / 2) - 2
-    local buttonSize = imgui.ImVec2(buttonSide, buttonSide - 5)
-
-    if data.isFlashminer then
-        if ButtonWithHint(fa.ARROW_LEFT .. "##left", "Переключиться на предыдущую ферму.",
-                not data.working, buttonSize) then
-            flashminerTool.navigate(-1)
-        end
-
-        imgui.SameLine(0, imgui.GetStyle().ItemSpacing.x + 5)
-
-        if ButtonWithHint(fa.ARROW_RIGHT .. "##right", "Переключиться на следующую ферму.",
-                not data.working, buttonSize) then
-            flashminerTool.navigate(1)
-        end
-    else
-        ButtonWithHint(fa.ARROW_LEFT .. "##left_disabled", "Доступно только в Флешке Майнера.",
-            false, buttonSize)
-        imgui.SameLine(0, imgui.GetStyle().ItemSpacing.x + 5)
-        ButtonWithHint(fa.ARROW_RIGHT .. "##right_disabled", "Доступно только в Флешке Майнера.",
-            false, buttonSize)
-    end
-end
-
-function __i__bottomPanel()
-    imgui.BeginChild('##bottom_panel_child', imgui.ImVec2(0, 0), false, imgui.WindowFlags.NoScrollbar)
-
-    local style = imgui.GetStyle()
-    local textLineHeight = imgui.GetTextLineHeight()
-    local sliderHeight = textLineHeight + style.FramePadding.y * 2
-    local staticContentHeight = (textLineHeight * 2) + sliderHeight + (style.ItemSpacing.y * 2)
-
-    local availableHeight = imgui.GetContentRegionAvail().y
-    local dynamicHeight = availableHeight - staticContentHeight
-    local elementHeight = (dynamicHeight - (style.ItemSpacing.y * 3)) / 4 - 1
-
-    if elementHeight < 20 then elementHeight = 20 end
-
-    -- Ряд 1: Кнопка "Снять криптовалюту"
-    local canWithdraw = data.forImgui.earnings.btc >= 1 or data.forImgui.earnings.asc >= 1
-    local withdrawHint = canWithdraw and "Снять всю доступную криптовалюту" or "Нет криптовалюты для снятия"
-    if data.working then withdrawHint = "Дождитесь завершения текущей операции" end
-
-    if ButtonWithHint("Снять криптовалюту", withdrawHint,
-            canWithdraw and not data.working, imgui.ImVec2(-1, elementHeight)) then
-        coolantTool.resetSupplyFlag()
-        local task = buildTaskTable('takeCrypto')
-        task:takeCrypto()
-    end
-
-    -- Ряд 2: Кнопки "Включить/Выключить"
-    local halfButtonWidth = (imgui.GetContentRegionAvail().x - style.ItemSpacing.x) / 2
-
-    local switchOnHint = data.working and "Дождитесь завершения текущей операции" or "Включить все видеокарты"
-    if ButtonWithHint("Включить видеокарты", switchOnHint, not data.working,
-            imgui.ImVec2(halfButtonWidth, elementHeight)) then
-        local task = buildTaskTable('switchCards')
-        task:switchCards(true)
-    end
-
-    imgui.SameLine()
-
-    local switchOffHint = data.working and "Дождитесь завершения текущей операции" or "Выключить все видеокарты"
-    if ButtonWithHint("Выключить видеокарты", switchOffHint, not data.working,
-            imgui.ImVec2(halfButtonWidth, elementHeight)) then
-        local task = buildTaskTable('switchCards')
-        task:switchCards(false)
-    end
-
-    -- Ряд 3: Кнопка "Залить жидкость"
-    local canRefill = not data.isFlashminer and not data.working
-    local coolantHint
-    if data.isFlashminer then
-        coolantHint = "Недоступно в флешке майнера"
-    elseif data.working then
-        coolantHint = "Дождитесь завершения текущей операции"
-    else
-        coolantHint = "Залить охлаждающую жидкость во все видеокарты"
-    end
-
-
-    if ButtonWithHint("Залить жидкость", coolantHint, canRefill, imgui.ImVec2(-1, elementHeight)) then
-        local task = buildTaskTable('coolant')
-        task:coolant()
-    end
-
-    -- Ряд 4: Чекбоксы.
-    local cursorY_before = imgui.GetCursorPosY()
-    imgui.Dummy(imgui.ImVec2(-1, elementHeight))
-    local cursorY_after = imgui.GetCursorPosY()
-
-    local checkboxHeight = textLineHeight + style.FramePadding.y * 2
-    imgui.SetCursorPosY(cursorY_before + (elementHeight - checkboxHeight) / 2)
-
-    if imgui.Checkbox("Использовать Супер Охлаждающую Жидкость", imcfg.useSuperCoolant) then
-        cfg.useSuperCoolant = imcfg.useSuperCoolant[0]; save()
-    end
-    imgui.Hint("Использовать Супер Охлаждающую Жидкость вместо обычной.\n(Для  BTC карт и Asic Miner)")
-    imgui.SameLine()
-    if imgui.Checkbox("Режим Экономии##econom", imcfg.economyMode) then
-        cfg.economyMode = imcfg.economyMode[0]; save()
-    end
-    imgui.Hint(
-        "Включает экономию охлаждающей жидкости.\nРаботает только с обычными жидкостями и вне Вайс-Сити (и не для суперохлаждающих).\nКак это работает: если посли заливки одной жидкости уровень охлаждения достигает 70 и выше, то вторая жидкость не расходуется.\nБез этого режима скрипт всегда заполняет охлаждение до 100%.")
-
-    imgui.SetCursorPosY(cursorY_after)
-
-    imgui.Text("Порог срабатывания заливки:")
-    imgui.TextDisabled("Если процент охлаждающей жидкости < настроенной ниже, то заливаем.")
-    imgui.PushItemWidth(-1)
-    if imgui.SliderInt("##coolantPercent", imcfg.useCoolantPercent, 1, 100, "%d%%") then
-        cfg.useCoolantPercent = imcfg.useCoolantPercent[0]; save()
-    end
-    imgui.PopItemWidth()
-
-    imgui.EndChild()
-end
 
 -- при флешке майнера
 local _fashFrame      = 0
@@ -7926,7 +8533,10 @@ local function filterAndSortHouses(houses)
 end
 
 -- флешка майнера
-imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(player)
+imgui.OnFrame(function()
+    return data.showHouseControlWindow[0] and
+        not (IS_MOBILE and (data.showHelpWindow[0] or data.showSettingsWindow[0]))
+end, function(player)
     _fashFrame = _fashFrame + 1
     if not cfg.helpShown and not cfg.useDialogMode then
         data.setupPage         = 1
@@ -7941,11 +8551,34 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
         updatePopupOpen(false)
     end
     local sw, sh = getScreenResolution()
-    imgui.SetNextWindowSize(imgui.ImVec2(1000, 680), imgui.Cond.FirstUseEver)
-    imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), imgui.Cond.FirstUseEver, imgui.ImVec2(0.5, 0.5))
+    local defaultW = IS_MOBILE and math.floor(sw * 0.90) or 1000
+    local defaultH = IS_MOBILE and math.floor(sh * 0.84) or 680
+    local resetCondition = data.mainWindowResetRequested and imgui.Cond.Always or imgui.Cond.FirstUseEver
 
-    if imgui.Begin("Mining Tools##MainWin", data.showHouseControlWindow,
-            imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar + imgui.WindowFlags.NoResize) then
+    imgui.SetNextWindowSize(imgui.ImVec2(defaultW, defaultH), resetCondition)
+    imgui.SetNextWindowPos(imgui.ImVec2(sw / 2, sh / 2), resetCondition, imgui.ImVec2(0.5, 0.5))
+
+    if IS_MOBILE then
+        local minW = math.max(560, math.floor(sw * 0.55))
+        local minH = math.max(360, math.floor(sh * 0.55))
+        imgui.SetNextWindowSizeConstraints(
+            imgui.ImVec2(minW, minH),
+            imgui.ImVec2(math.max(minW, sw - 20), math.max(minH, sh - 20))
+        )
+    end
+
+    if data.mainWindowResetRequested then
+        data.mainWindowResetRequested = false
+    end
+
+    local mainWindowFlags = imgui.WindowFlags.NoCollapse + imgui.WindowFlags.NoTitleBar
+    if IS_MOBILE then
+        mainWindowFlags = mainWindowFlags + imgui.WindowFlags.NoResize + imgui.WindowFlags.NoMove
+    else
+        mainWindowFlags = mainWindowFlags + imgui.WindowFlags.NoResize
+    end
+
+    if imgui.Begin("Mining Tools##MainWin", data.showHouseControlWindow, mainWindowFlags) then
         imgui.customTitleBar(data.showHouseControlWindow, resetDefaultCfg, imgui.GetWindowWidth())
 
         local filteredHouses, availableLevels, availableCities = filterAndSortHouses(data.dialogData.flashminer)
@@ -8022,11 +8655,14 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
 
         -- Плитки статистики
         local availWidth = imgui.GetContentRegionAvail().x
-        local statCardWidth = (availWidth - 24) / 4
+        local statColumns = IS_MOBILE and 2 or 4
+        local statGap = IS_MOBILE and 10 or 8
+        local statCardWidth = (availWidth - statGap * (statColumns - 1)) / statColumns
+        local statCardHeight = IS_MOBILE and 52 or 36
 
         local function DrawStatTile(childId, icon, label, value, valColor, hintText)
             imgui.PushStyleColor(imgui.Col.ChildBg, accentTint(0.09, 0.10, 0.14, 0.25, 1.00))
-            imgui.BeginChild("stat_" .. childId, imgui.ImVec2(statCardWidth, 36), true)
+            imgui.BeginChild("stat_" .. childId, imgui.ImVec2(statCardWidth, statCardHeight), true)
 
             local iconSize = imgui.CalcTextSize(icon)
             local labelParsed = label:gsub("{.-}", "")
@@ -8037,7 +8673,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
 
             local startX = (statCardWidth - totalWidth) / 2
             local lineH = imgui.GetTextLineHeight()
-            local startY = (36 - lineH) / 2
+            local startY = (statCardHeight - lineH) / 2
 
             imgui.SetCursorPos(imgui.ImVec2(startX, startY))
 
@@ -8070,7 +8706,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
             allBtc, allAsc)
 
         DrawStatTile("crypto", fa.COINS, "{BEF781}Доступно:", cryptoText, "{FFFFFF}", totalHint)
-        imgui.SameLine()
+        if IS_MOBILE then imgui.Spacing() else imgui.SameLine() end
 
         -- Колонка 3: Общий баланс
         DrawStatTile("balance", fa.DOLLAR_SIGN, "{FFD700}Баланс:", "$" .. utils.formatNumber(totalBalance),
@@ -8133,7 +8769,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
 
         imgui.Spacing()
 
-        local barH = 30
+        local barH = IS_MOBILE and 44 or 30
         local isLogsHovered = false
 
         imgui.PushStyleColor(imgui.Col.ChildBg,
@@ -8182,20 +8818,23 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
         imgui.Spacing()
 
         imgui.PushStyleColor(imgui.Col.ChildBg, accentTint(0.09, 0.10, 0.14, 0.25, 1.00))
-        imgui.BeginChild("##action_panel", imgui.ImVec2(0, 60), true)
+        local actionPanelHeight = IS_MOBILE and 198 or 60
+        imgui.BeginChild("##action_panel", imgui.ImVec2(0, actionPanelHeight), true)
         imgui.showNotifications(2)
 
-        local btnWidth = (availWidth - 55) / 5
-        local btnHeight = 35
+        local btnWidth = IS_MOBILE and ((imgui.GetContentRegionAvail().x - 10) / 2)
+            or ((availWidth - 55) / 5)
+        local btnHeight = IS_MOBILE and 46 or 35
 
-        local function DrawActionBtn(label, icon, colorVec, taskName, arg)
+        local function DrawActionBtn(label, icon, colorVec, taskName, arg, widthOverride)
             imgui.PushStyleColor(imgui.Col.Button, colorVec)
             imgui.PushStyleColor(imgui.Col.ButtonHovered,
                 imgui.ImVec4(colorVec.x * 1.2, colorVec.y * 1.2, colorVec.z * 1.2, 1.0))
             imgui.PushStyleColor(imgui.Col.ButtonActive,
                 imgui.ImVec4(colorVec.x * 0.8, colorVec.y * 0.8, colorVec.z * 0.8, 1.0))
 
-            local pressed = imgui.Button(icon .. " " .. (label), imgui.ImVec2(btnWidth, btnHeight))
+            local pressed = imgui.Button(icon .. " " .. (label),
+                imgui.ImVec2(widthOverride or btnWidth, btnHeight))
             imgui.PopStyleColor(3)
 
             if pressed then
@@ -8210,22 +8849,30 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
             return pressed
         end
 
+        local function NextActionButton(index)
+            if IS_MOBILE then
+                if index % 2 == 1 then imgui.SameLine() else imgui.Spacing() end
+            else
+                imgui.SameLine()
+            end
+        end
+
         DrawActionBtn("Собрать", fa.DOLLAR_SIGN, imgui.ImVec4(0.3, 0.8, 0.3, 1), "collectFromAllHouses")
         imgui.Hint("Собрать криптовалюту со всех домов")
 
-        imgui.SameLine()
+        NextActionButton(1)
         DrawActionBtn("Включить", fa.POWER_OFF, imgui.ImVec4(0.2, 0.6, 1, 1), "massSwitchCards", true)
         imgui.Hint("Включить все видеокарты во всех домах")
 
-        imgui.SameLine()
+        NextActionButton(2)
         DrawActionBtn("Выключить", fa.PLUG, imgui.ImVec4(1, 0.3, 0.3, 1), "massSwitchCards", false)
         imgui.Hint("Выключить все видеокарты во всех домах")
 
-        imgui.SameLine()
+        NextActionButton(3)
         DrawActionBtn("Обновить", fa.ROTATE, imgui.ImVec4(0.8, 0.6, 0.2, 1), "updateStatuses")
         imgui.Hint("Обновить статусы всех домов.\nНе проверяет наличие подвалов.")
 
-        imgui.SameLine()
+        NextActionButton(4)
         local fixLabel, fixIcon, fixColor, fixHint
         if cfg.useSimpleTopUp then
             fixLabel = "Пополнить баланс"
@@ -8247,7 +8894,8 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
             end
         end
         local fixTaskName = cfg.useSimpleTopUp and "autoTopUp" or "fixAllProblems"
-        DrawActionBtn(fixLabel, fixIcon, fixColor, fixTaskName)
+        DrawActionBtn(fixLabel, fixIcon, fixColor, fixTaskName, nil,
+            IS_MOBILE and imgui.GetContentRegionAvail().x or nil)
         imgui.Hint(fixHint)
 
         imgui.EndChild()
@@ -8255,8 +8903,8 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
 
         imgui.Text((string.format("Список домов (%d из %d)", #filteredHouses, totalHouses)))
         imgui.SameLine()
-        imgui.SetCursorPosX(imgui.GetWindowWidth() - 220)
-        if imgui.Checkbox("Режим исключённых", imcfg.showExcludedHouses) then
+        imgui.SetCursorPosX(imgui.GetWindowWidth() - (IS_MOBILE and 210 or 220))
+        if imgui.Checkbox(IS_MOBILE and "Исключения" or "Режим исключённых", imcfg.showExcludedHouses) then
             cfg.showExcludedHouses = imcfg.showExcludedHouses[0]
             _fashFrame = _fashFrame + 1
             save()
@@ -8266,8 +8914,9 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
         if data.working then
             __i__progressPanel()
         else
-            if imgui.BeginChild("##scrollArea", imgui.ImVec2(0, 0), false, imgui.WindowFlags.NoScrollWithMouse) then
-                local itemHeight = 130
+            local scrollFlags = IS_MOBILE and 0 or imgui.WindowFlags.NoScrollWithMouse
+            if imgui.BeginChild("##scrollArea", imgui.ImVec2(0, 0), false, scrollFlags) then
+                local itemHeight = IS_MOBILE and 160 or 130
                 imgui.Scroller("house_list", itemHeight, 400,
                     imgui.HoveredFlags.RectOnly + imgui.HoveredFlags.ChildWindows)
 
@@ -8284,7 +8933,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
                     end
 
                     if targetIndex then
-                        local columns = 2
+                        local columns = IS_MOBILE and 1 or 2
                         local rowIndex = math.ceil(targetIndex / columns)
                         local targetScroll = (rowIndex - 1) * itemHeight
                         local scrollMax = imgui.GetScrollMaxY()
@@ -8298,11 +8947,11 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
                     data.scrollToSelection = false
                 end
 
-                local columns = 2
-                local spacing = 10
-                local regionW = imgui.GetContentRegionAvail().x
+                local columns = IS_MOBILE and 1 or 2
+                local spacing = IS_MOBILE and 0 or 10
+                local regionW = imgui.GetContentRegionAvail().x - (IS_MOBILE and 14 or 0)
                 local cardW = (regionW - spacing * (columns - 1)) / columns
-                local cardH = 136
+                local cardH = IS_MOBILE and 152 or 136
 
                 for i, house in ipairs(filteredHouses) do
                     local status = data.houseStatuses[house.house_number]
@@ -8351,8 +9000,8 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
 
                     imgui.PushStyleColor(imgui.Col.ChildBg, accentTint(0.12, 0.13, 0.17, 0.25, 1.00))
                     imgui.BeginChild("house_card_" .. i, imgui.ImVec2(cardW, cardH), false)
-                    local barW = 140
-                    local rightColX = cardW - barW - 10
+                    local rightColX = IS_MOBILE and math.floor(cardW * 0.70) or (cardW - 150)
+                    local barW = IS_MOBILE and math.max(190, cardW - rightColX - 28) or 140
                     local p = imgui.GetCursorScreenPos()
                     local dl = imgui.GetWindowDrawList()
 
@@ -8387,8 +9036,18 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
                         5
                     )
 
+                    if IS_MOBILE then
+                        local dividerX = p.x + rightColX - 18
+                        dl:AddLine(
+                            imgui.ImVec2(dividerX, p.y + 12),
+                            imgui.ImVec2(dividerX, p.y + cardH - 12),
+                            imgui.ColorConvertFloat4ToU32(imgui.ImVec4(0.30, 0.34, 0.42, 0.32)),
+                            1.0
+                        )
+                    end
+
                     -- Контент карточки
-                    imgui.SetCursorPos(imgui.ImVec2(16, 8))
+                    imgui.SetCursorPos(imgui.ImVec2(IS_MOBILE and 20 or 16, IS_MOBILE and 10 or 8))
 
                     -- Строка 1: Дом и Город
                     imgui.BeginGroup()
@@ -8415,7 +9074,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
 
                     -- Строка 2: Статус и Баланс
 
-                    imgui.SetCursorPos(imgui.ImVec2(16, 32))
+                    imgui.SetCursorPos(imgui.ImVec2(IS_MOBILE and 20 or 16, IS_MOBILE and 38 or 32))
                     imgui.BeginGroup()
                     imgui.Text(statusIcon)
                     imgui.SameLine()
@@ -8437,7 +9096,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
 
                     -- Строка 3: Криптовалюта и Налог
 
-                    imgui.SetCursorPos(imgui.ImVec2(16, 52))
+                    imgui.SetCursorPos(imgui.ImVec2(IS_MOBILE and 20 or 16, IS_MOBILE and 65 or 52))
                     imgui.BeginGroup()
                     imgui.TextColored(imgui.ImVec4(0.75, 0.97, 0.51, 1.0), fa.COINS)
                     imgui.SameLine()
@@ -8486,7 +9145,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
                     imgui.Hint("Текущий налог на дом")
 
                     -- Строка 4: Видеокарты и Жидкость
-                    imgui.SetCursorPos(imgui.ImVec2(16, 72))
+                    imgui.SetCursorPos(imgui.ImVec2(IS_MOBILE and 20 or 16, IS_MOBILE and 92 or 72))
                     imgui.BeginGroup()
                     -- Видеокарты
                     local totalCards, workingCards = 0, 0
@@ -8541,7 +9200,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
                     end
 
                     imgui.SameLine()
-                    local barW = 140
+                    local barW = IS_MOBILE and math.max(190, cardW - rightColX - 28) or 140
                     imgui.SetCursorPosX(rightColX)
                     imgui.SetCursorPosY(imgui.GetCursorPosY() + 2)
 
@@ -8615,7 +9274,7 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
                     end
 
                     -- Строка 5: Время работы
-                    imgui.SetCursorPos(imgui.ImVec2(16, 110))
+                    imgui.SetCursorPos(imgui.ImVec2(IS_MOBILE and 20 or 16, IS_MOBILE and 130 or 110))
                     imgui.BeginGroup()
                     imgui.EndGroup()
 
@@ -8737,6 +9396,9 @@ imgui.OnFrame(function() return data.showHouseControlWindow[0] end, function(pla
             imgui.End()
         end
 
+        if IS_MOBILE then
+            imgui.mobileResizeGrip()
+        end
         imgui.End()
     end
 end)
@@ -8754,7 +9416,7 @@ function __i__progressPanel()
     local targetInner = data.progressHouseTotal > 0 and (data.progressHouseCurrent / data.progressHouseTotal) or 0
     targetInner = math.min(math.max(targetInner, 0), 1)
 
-    local currentTime = os.clock()
+    local currentTime = monotonicSeconds()
     local deltaTime = math.min(currentTime - (data.progressSmooth.lastUpdateTime or currentTime), 0.1)
     data.progressSmooth.lastUpdateTime = currentTime
 
@@ -8863,77 +9525,132 @@ function __i__progressPanel()
     imgui.EndChild()
 end
 
+function imgui.mobileResizeGrip()
+    if not IS_MOBILE then return end
+
+    local ws = imgui.GetWindowSize()
+    local wp = imgui.GetWindowPos()
+    local sw, sh = getScreenResolution()
+    local gripSize = 72
+
+    imgui.SetCursorPos(imgui.ImVec2(
+        math.max(0, ws.x - gripSize),
+        math.max(0, ws.y - gripSize)
+    ))
+    imgui.InvisibleButton("##mobile_manual_resize_grip", imgui.ImVec2(gripSize, gripSize))
+
+    local active = imgui.IsItemActive()
+    local hovered = imgui.IsItemHovered()
+
+    if active and imgui.IsMouseDragging(0, 0.0) then
+        local delta = imgui.GetIO().MouseDelta
+        local minW = math.max(560, math.floor(sw * 0.55))
+        local minH = math.max(360, math.floor(sh * 0.55))
+        local maxW = math.max(minW, sw - math.max(0, wp.x) - 10)
+        local maxH = math.max(minH, sh - math.max(0, wp.y) - 10)
+        local newW = math.max(minW, math.min(ws.x + delta.x, maxW))
+        local newH = math.max(minH, math.min(ws.y + delta.y, maxH))
+
+        imgui.SetWindowSizeVec2(imgui.ImVec2(newW, newH), imgui.Cond.Always)
+    end
+
+    local rmin = imgui.GetItemRectMin()
+    local rmax = imgui.GetItemRectMax()
+    local color = (hovered or active)
+        and imgui.ImVec4(0.42, 0.72, 1.00, 0.95)
+        or imgui.ImVec4(0.62, 0.66, 0.74, 0.70)
+    local packed = imgui.ColorConvertFloat4ToU32(color)
+    local dl = imgui.GetWindowDrawList()
+
+    dl:AddLine(imgui.ImVec2(rmax.x - 30, rmax.y - 8), imgui.ImVec2(rmax.x - 8, rmax.y - 30), packed, 3.0)
+    dl:AddLine(imgui.ImVec2(rmax.x - 20, rmax.y - 8), imgui.ImVec2(rmax.x - 8, rmax.y - 20), packed, 3.0)
+    dl:AddLine(imgui.ImVec2(rmax.x - 10, rmax.y - 8), imgui.ImVec2(rmax.x - 8, rmax.y - 10), packed, 3.0)
+end
+
 function imgui.customTitleBar(param, resetFunc, windowWidth)
     local imStyle = imgui.GetStyle()
+    local btnW = IS_MOBILE and 58 or 50
+    local btnH = IS_MOBILE and 40 or 25
+    local titleY = IS_MOBILE and 10 or (imStyle.ItemSpacing.y + 5)
+    local buttonY = IS_MOBILE and 4 or imStyle.ItemSpacing.y
+    local linkW = IS_MOBILE and 0 or 30
+    local rightReserved = linkW + btnW * 2 + imStyle.ItemSpacing.x * (IS_MOBILE and 3 or 4)
+    local centerZone = windowWidth - imStyle.WindowPadding.x - rightReserved
+    local titleX = IS_MOBILE
+        and ((windowWidth - imgui.CalcTextSize(script.this.name).x) / 2)
+        or (imStyle.WindowPadding.x + math.max(0,
+            centerZone / 2 - imgui.CalcTextSize(script.this.name).x / 2))
 
-    imgui.SetCursorPosY(imStyle.ItemSpacing.y + 5)
-    imgui.SameLine()
-    -- РџСЂР°РІР°СЏ СЃС‚РѕСЂРѕРЅР° Р·Р°РЅСЏС‚Р°: СЃСЃС‹Р»РєР° (280px) + РєРЅРѕРїРєР° РјРµРЅСЋ (50px) + РєРЅРѕРїРєР° Р·Р°РєСЂС‹С‚СЊ (50px) + РѕС‚СЃС‚СѓРїС‹
-    -- Р›РµРІР°СЏ СЃС‚РѕСЂРѕРЅР° РїСѓСЃС‚Р°СЏ, РїРѕСЌС‚РѕРјСѓ С†РµРЅС‚СЂРёСЂСѓРµРј РѕС‚РЅРѕСЃРёС‚РµР»СЊРЅРѕ РІСЃРµРіРѕ РѕРєРЅР°
-    local rightReserved = 30 + 50 + 50 + imStyle.ItemSpacing.x * 4
-    local leftReserved = imStyle.WindowPadding.x
-    local centerZone = windowWidth - leftReserved - rightReserved
-    local titleX = leftReserved + math.max(0, centerZone / 2 - imgui.CalcTextSize(script.this.name).x / 2)
-    if data.isViceCity then
-        titleX = titleX - 20
+    if IS_MOBILE then
+        local dragWidth = math.max(140,
+            windowWidth - btnW * 2 - imStyle.ItemSpacing.x * 3)
+        imgui.SetCursorPos(imgui.ImVec2(0, 0))
+        imgui.InvisibleButton("##mobile_manual_title_drag", imgui.ImVec2(dragWidth, 52))
+
+        if imgui.IsItemActive() and imgui.IsMouseDragging(0, 0.0) then
+            local delta = imgui.GetIO().MouseDelta
+            local wp = imgui.GetWindowPos()
+            local ws = imgui.GetWindowSize()
+            local sw, sh = getScreenResolution()
+            local maxX = math.max(0, sw - ws.x)
+            local maxY = math.max(0, sh - ws.y)
+            local newX = math.max(0, math.min(wp.x + delta.x, maxX))
+            local newY = math.max(0, math.min(wp.y + delta.y, maxY))
+
+            imgui.SetWindowPosVec2(imgui.ImVec2(newX, newY), imgui.Cond.Always)
+        end
     end
+
+    imgui.SetCursorPosY(titleY)
     imgui.SetCursorPosX(titleX)
     imgui.TextColoredRGB(script.this.name)
+
     if data.isViceCity then
         imgui.SameLine(0, 6)
-        imgui.SetCursorPosY(imStyle.ItemSpacing.y + 5)
+        imgui.SetCursorPosY(titleY)
         imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.4, 0.8, 1.0, 1.0))
         imgui.Text("VC")
         imgui.PopStyleColor()
         imgui.Hint("Вы находитесь в Vice City.\nОбычная охлаждающая жидкость работает как супер (100%).")
     end
 
-    imgui.SameLine()
-
-    imgui.SetCursorPosX(windowWidth - 168 - imStyle.ItemSpacing.x)
-    imgui.SetCursorPosY(imStyle.ItemSpacing.y)
-    imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0, 0, 0, 0))
-    imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.2, 0.2, 0.3, 0.5))
-    imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.25, 0.25, 0.35, 0.7))
-    imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.90, 0.20, 0.20, 1.0))
-    if imgui.Button(fa('HEART') .. '##bounteiro_link', imgui.ImVec2(30, 25)) then
-        imgui.SetClipboardText("https://t.me/b0unteiro")
-        imgui.addNotification("t.me/b0unteiro copied!")
+    if not IS_MOBILE then
+        imgui.SetCursorPosX(windowWidth - 168 - imStyle.ItemSpacing.x)
+        imgui.SetCursorPosY(buttonY)
+        imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0, 0, 0, 0))
+        imgui.PushStyleColor(imgui.Col.ButtonHovered, imgui.ImVec4(0.2, 0.2, 0.3, 0.5))
+        imgui.PushStyleColor(imgui.Col.ButtonActive, imgui.ImVec4(0.25, 0.25, 0.35, 0.7))
+        imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.90, 0.20, 0.20, 1.0))
+        if imgui.Button(fa('HEART') .. '##bounteiro_link', imgui.ImVec2(30, btnH)) then
+            imgui.SetClipboardText("https://t.me/b0unteiro")
+            imgui.addNotification("t.me/b0unteiro copied!")
+        end
+        imgui.PopStyleColor(4)
+        if imgui.IsItemHovered() then
+            imgui.BeginTooltip()
+            imgui.TextColored(imgui.ImVec4(0.90, 0.20, 0.20, 1.0), fa("HEART") .. " Fixed by bounteiro")
+            imgui.TextColored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0), "t.me/b0unteiro")
+            imgui.EndTooltip()
+        end
     end
-    imgui.PopStyleColor(4)
-    if imgui.IsItemHovered() then
-        imgui.BeginTooltip()
-        imgui.TextColored(imgui.ImVec4(0.90, 0.20, 0.20, 1.0), fa("HEART") .. " Fixed by bounteiro")
-        imgui.TextColored(imgui.ImVec4(0.6, 0.6, 0.6, 1.0), "t.me/b0unteiro")
-        imgui.TextColored(imgui.ImVec4(0.5, 0.5, 0.5, 1.0), "Click to copy link")
-        imgui.EndTooltip()
-    end
-    imgui.SameLine()
 
-    imgui.SetCursorPosX(windowWidth - 110 - imStyle.ItemSpacing.x)
-    imgui.SetCursorPosY(imStyle.ItemSpacing.y)
-    if imgui.Button(fa("BARS") .. "##settings_button", imgui.ImVec2(50, 25)) then
+    imgui.SetCursorPosX(windowWidth - btnW * 2 - imStyle.ItemSpacing.x * 2)
+    imgui.SetCursorPosY(buttonY)
+    if imgui.Button(fa("BARS") .. "##settings_button", imgui.ImVec2(btnW, btnH)) then
         data.showSettingsWindow[0] = not data.showSettingsWindow[0]
     end
 
-    imgui.SameLine()
-
-    imgui.SetCursorPosX(windowWidth - 50 - imStyle.ItemSpacing.x)
-    imgui.SetCursorPosY(imStyle.ItemSpacing.y)
-    if imgui.ButtonClickable("Подождите...", not data.working, fa("XMARK") .. "##close_button", imgui.ImVec2(50, 25)) then
+    imgui.SetCursorPosX(windowWidth - btnW - imStyle.ItemSpacing.x)
+    imgui.SetCursorPosY(buttonY)
+    if imgui.ButtonClickable("Подождите...", not data.working,
+            fa("XMARK") .. "##close_button", imgui.ImVec2(btnW, btnH)) then
         fixI()
         param[0] = false
         data.showSettingsWindow[0] = false
     end
 
-    if imgui.BeginPopup("donationPopupMenu") then
-        imgui.Text(("Fixed by bounteiro"), 0xFF3333E6, 0xFF2222CC)
-        if imgui.Link("t.me/b0unteiro", "Нажми чтобы скопировать") then
-            imgui.SetClipboardText("https://t.me/b0unteiro")
-            imgui.addNotification("Ссылка скопирована!")
-        end
-        imgui.EndPopup()
-    end
+    imgui.SetCursorPosY(IS_MOBILE and 52 or 36)
+    imgui.Separator()
 end
 
 local notifications = {}
@@ -8941,12 +9658,12 @@ local notifications = {}
 function imgui.addNotification(text)
     table.insert(notifications, {
         text = text,
-        startTime = os.clock()
+        startTime = monotonicSeconds()
     })
 end
 
 function imgui.showNotifications(duration)
-    local currentTime = os.clock()
+    local currentTime = monotonicSeconds()
     local activeNotifications = #notifications
 
     -- Начинаем отображение подсказок, если есть активные уведомления
@@ -8958,7 +9675,7 @@ function imgui.showNotifications(duration)
         -- Проверяем, прошло ли время показа
         if currentTime - notification.startTime < duration then
             imgui.Text(notification.text)
-            activeNotifications = activeNotifications + 1
+            -- activeNotifications already contains the current list size.
             -- Если это не последнее уведомление, добавляем разделитель
             if i > 1 then
                 imgui.Separator()
@@ -8994,10 +9711,12 @@ setmetatable(imgui.Scroller, {
         end
 
         if imgui.Scroller._ids[id].start_clock then
-            local elapsed = (os.clock() - imgui.Scroller._ids[id].start_clock) * 1000
+            local animationDuration = imgui.Scroller._ids[id].duration or duration or 300
+            animationDuration = math.max(1, animationDuration)
+            local elapsed = (monotonicSeconds() - imgui.Scroller._ids[id].start_clock) * 1000
 
-            if elapsed <= duration then
-                local progress = elapsed / duration
+            if elapsed <= animationDuration then
+                local progress = elapsed / animationDuration
                 local fading_progress = progress * (2 - progress)
                 local distance = imgui.Scroller._ids[id].target_position - imgui.Scroller._ids[id].start_position
                 local new_position = imgui.Scroller._ids[id].start_position + distance * fading_progress
@@ -9023,11 +9742,13 @@ setmetatable(imgui.Scroller, {
             local offset = -wheel_delta * step
 
             if not imgui.Scroller._ids[id].start_clock then
-                imgui.Scroller._ids[id].start_clock = os.clock()
+                imgui.Scroller._ids[id].start_clock = monotonicSeconds()
+                imgui.Scroller._ids[id].duration = duration or 300
                 imgui.Scroller._ids[id].start_position = current_position
                 imgui.Scroller._ids[id].target_position = current_position + offset
             else
-                imgui.Scroller._ids[id].start_clock = os.clock()
+                imgui.Scroller._ids[id].start_clock = monotonicSeconds()
+                imgui.Scroller._ids[id].duration = duration or 300
                 imgui.Scroller._ids[id].start_position = current_position
 
                 if imgui.Scroller._ids[id].start_position < imgui.Scroller._ids[id].target_position and offset > 0 then
@@ -9048,7 +9769,8 @@ function imgui.ScrollToPosition(id, targetPosition, duration)
     end
 
     local current_position = imgui.GetScrollY()
-    imgui.Scroller._ids[id].start_clock = os.clock()
+    imgui.Scroller._ids[id].start_clock = monotonicSeconds()
+    imgui.Scroller._ids[id].duration = duration or 300
     imgui.Scroller._ids[id].start_position = current_position
     imgui.Scroller._ids[id].target_position = targetPosition
 end
@@ -9289,7 +10011,7 @@ function renderResetConfirm(idSuffix, timerStartedAt, title, subtitle, onConfirm
         imgui.Separator()
         imgui.Spacing()
 
-        local elapsed    = os.clock() - (timerStartedAt or 0)
+        local elapsed    = monotonicSeconds() - (timerStartedAt or 0)
         local remaining  = math.ceil(5 - elapsed)
         local canConfirm = elapsed >= 5.0
         local halfW      = (imgui.GetContentRegionAvail().x - imgui.GetStyle().ItemSpacing.x) / 2
