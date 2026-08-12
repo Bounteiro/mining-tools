@@ -1,7 +1,7 @@
 script_name('Mining Tools')
 script_author('bounteiro (t.me/b0unteiro)')
-script_version('6.7.7')
-script_version_number(8)
+script_version('6.7.8')
+script_version_number(9)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
 local sampfuncs = require("sampfuncs")
@@ -78,7 +78,7 @@ local json = (function()
 end)()
 
 local AUTO_UPDATE_ENABLED = true
-local UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Bounteiro/mining-tools/main/version.json"
+local UPDATE_CHECK_URL = "https://raw.githubusercontent.com/Bounteiro/mining-tools/main/version.json?t=" .. tostring(os.time())
 
 local searchBuffer = new.char[256]()
 local currentStatusFilter = new.int(0)
@@ -168,8 +168,9 @@ local dialogIdTable          = {
 do
     Jcfg = {
         _version = 0.1,
-        _author = "SaBoARZ",
-        _telegram = "@SaBoARZ",
+        _author = "bounteiro",
+        _telegram = "@b0unteiro",
+        _github = "https://github.com/Bounteiro",
         _help = [[Jcfg - модуль для сохранения и загрузки конфигурационных файлов...]]
     }
 
@@ -2355,24 +2356,56 @@ local collectTool = (function()
         end
     end
 
-    function self.runSilent(doUpdateStatuses)
-        if data.hasFlashminer == false then
-            return false
-        end
-        local restoreHouseControl  = data.showHouseControlWindow[0] == true
-        data.silentWindowOpen      = true
-        data.showLogsWindow[0]     = false
-        data.showSettingsWindow[0] = false
+  function self.runSilent(doUpdateStatuses)
+    if data.hasFlashminer == false then
+        return false
+    end
+    local restoreHouseControl  = data.showHouseControlWindow[0] == true
+    data.silentWindowOpen      = true
+    data.showLogsWindow[0]     = false
+    data.showSettingsWindow[0] = false
 
+    -- Открываем флешку с повторными попытками
+    data.dialogData.flashminer = {}
+    local attempts = 0
+    local maxAttempts = 5
     
-        data.dialogData.flashminer = {}
-        local attempts = 0
-        while #data.dialogData.flashminer == 0 and attempts < 3 do
-            attempts = attempts + 1
-                 sampSendChat("/flashminer")
-            local t = 0
-            while #data.dialogData.flashminer == 0 and t < 8000 do
-                wait(200); t = t + 200
+    while #data.dialogData.flashminer == 0 and attempts < maxAttempts do
+        attempts = attempts + 1
+        utils.debugChat(string.format("[COLLECT] Открываю флешку, попытка %d/%d", attempts, maxAttempts))
+        
+        sampSendChat("/flashminer")
+        
+        local t = 0
+        local dialogOpened = false
+        
+        while t < 10000 do
+            wait(200)
+            t = t + 200
+            
+            if sampIsDialogActive() and sampGetCurrentDialogId() == data.dFlashminerId then
+                dialogOpened = true
+                break
+            end
+            
+            if #data.dialogData.flashminer > 0 then
+                dialogOpened = true
+                break
+            end
+            
+            if data.collectCancelled then
+                data.collectCancelled = false
+                taskState.setSilent(false)
+                data.silentWindowOpen = false
+                return false
+            end
+        end
+        
+        if dialogOpened and #data.dialogData.flashminer == 0 then
+            local waitData = 0
+            while #data.dialogData.flashminer == 0 and waitData < 3000 do
+                wait(200)
+                waitData = waitData + 200
                 if data.collectCancelled then
                     data.collectCancelled = false
                     taskState.setSilent(false)
@@ -2380,115 +2413,120 @@ local collectTool = (function()
                     return false
                 end
             end
-            if #data.dialogData.flashminer == 0 and attempts < 3 then
-                utils.debugChat(string.format("[COLLECT] House list empty, retry %d/3", attempts))
-                wait(500)
+        end
+        
+        if #data.dialogData.flashminer == 0 and attempts < maxAttempts then
+            if sampIsDialogActive() then
+                sampCloseCurrentDialogWithButton(0)
+                wait(300)
             end
         end
-        if #data.dialogData.flashminer == 0 then
-            data.silentWindowOpen     = false
-            data.notifyWindow.show[0] = false
+    end
+    
+    if #data.dialogData.flashminer == 0 then
+        utils.addChat("{F78181}Не удалось открыть флешку майнера после " .. maxAttempts .. " попыток")
+        data.silentWindowOpen = false
+        data.notifyWindow.show[0] = false
+        return false
+    end
+
+    if doUpdateStatuses then
+        local needsUpdate = false
+        local now2 = os.time()
+        for _, house in ipairs(data.dialogData.flashminer) do
+            local status = data.houseStatuses[house.house_number]
+            if not (status and status.lastCheck > 0 and (now2 - status.lastCheck) < 300) then
+                needsUpdate = true; break
+            end
+        end
+        if needsUpdate then
+            local updateTask = buildTaskTable('updateStatuses')
+            updateTask:run()
+            while data.working do
+                wait(200)
+                if data.collectCancelled then
+                    data.collectCancelled = false
+                    taskState.setSilent(false)
+                    data.stopAction = true
+                    data.silentWindowOpen = false
+                    return false
+                end
+            end
+        end
+    end
+
+    while data.working do
+        wait(200)
+        if data.collectCancelled then
+            data.collectCancelled = false
+            taskState.setSilent(false)
+            data.stopAction = true
+            data.silentWindowOpen = false
             return false
         end
-
-        if doUpdateStatuses then
-            local needsUpdate = false
-            local now2 = os.time()
+    end
+    local task = buildTaskTable('collectFromAllHouses')
+    task:run()
+    while data.working do
+        wait(200)
+        if data.collectCancelled then
+            data.collectCancelled = false
+            taskState.setSilent(false)
+            data.stopAction = true
+            data.silentWindowOpen = false
+            return false
+        end
+    end
+    if cfg.autoEnableCardsOnCollect then
+        wait(300)
+        if flashminerTool.requestList(5000) then
+            progressTracker.reset()
+            data.currentCollectHouse = ""
+            local housesWithCards = 0
             for _, house in ipairs(data.dialogData.flashminer) do
-                local status = data.houseStatuses[house.house_number]
-                -- РћР±РЅРѕРІР»СЏРµРј РµСЃР»Рё РґР°РЅРЅС‹С… РЅРµС‚ РёР»Рё РѕРЅРё СЃС‚Р°СЂС€Рµ 5 РјРёРЅСѓС‚
-                if not (status and status.lastCheck > 0 and (now2 - status.lastCheck) < 300) then
-                    needsUpdate = true; break
-                end
-            end
-            if needsUpdate then
-                local updateTask = buildTaskTable('updateStatuses')
-                updateTask:run()
-                while data.working do
-                    wait(200)
-                    if data.collectCancelled then
-                        data.collectCancelled = false
-                        taskState.setSilent(false)
-                        data.stopAction = true
-                        data.silentWindowOpen = false
-                        return false
+                if houseFilter.shouldProcess(house) then
+                    local status = data.houseStatuses[house.house_number]
+                    if status and status.cardLevels then
+                        local total, working = 0, 0
+                        for _, lvl in pairs(status.cardLevels) do
+                            total = total + lvl.total
+                            working = working + lvl.working
+                        end
+                        if total > working then
+                            housesWithCards = housesWithCards + 1
+                        end
                     end
                 end
             end
-        end
-
-        while data.working do
-            wait(200)
-            if data.collectCancelled then
-                data.collectCancelled = false
-                taskState.setSilent(false)
-                data.stopAction = true
-                data.silentWindowOpen = false
-                return false
-            end
-        end
-        local task = buildTaskTable('collectFromAllHouses')
-        task:run()
-        while data.working do
-            wait(200)
-            if data.collectCancelled then
-                data.collectCancelled = false
-                taskState.setSilent(false)
-                data.stopAction = true
-                data.silentWindowOpen = false
-                return false
-            end
-        end
-        if cfg.autoEnableCardsOnCollect then
-    wait(300)
-    if flashminerTool.requestList(5000) then
-        progressTracker.reset()
-        data.currentCollectHouse = ""
-        local housesWithCards = 0
-        for _, house in ipairs(data.dialogData.flashminer) do
-            if houseFilter.shouldProcess(house) then
-                local status = data.houseStatuses[house.house_number]
-                if status and status.cardLevels then
-                    local total, working = 0, 0
-                    for _, lvl in pairs(status.cardLevels) do
-                        total = total + lvl.total
-                        working = working + lvl.working
-                    end
-                    if total > working then
-                        housesWithCards = housesWithCards + 1
-                    end
+            data.progressCurrent = 0
+            data.progressTotal = housesWithCards
+            local switchTask = buildTaskTable('massSwitchCards')
+            switchTask:run(true)
+            while data.working do
+                wait(200)
+                if data.collectCancelled then
+                    data.collectCancelled = false
+                    taskState.setSilent(false)
+                    data.stopAction = true
+                    data.silentWindowOpen = false
+                    return false
                 end
             end
+            data.progressCurrent = 0
+            data.progressTotal = 0
         end
-        data.progressCurrent = 0
-        data.progressTotal = housesWithCards
-        local switchTask = buildTaskTable('massSwitchCards')
-        switchTask:run(true)
-        while data.working do
-            wait(200)
-            if data.collectCancelled then
-                data.collectCancelled = false
-                taskState.setSilent(false)
-                data.stopAction = true
-                data.silentWindowOpen = false
-                return false
-            end
-        end
-        data.progressCurrent = 0
-        data.progressTotal = 0
     end
+
+    taxTool.runWithCollect()
+    autoTopUpTool.runWithCollect()
+
+    fixI()
+    data.currentCollectHouse       = ""
+    data.silentWindowOpen          = false
+    data.showHouseControlWindow[0] = restoreHouseControl
+    data.notifyWindow.show[0]      = false
+    return true
 end
-
-        taxTool.runWithCollect()
-        autoTopUpTool.runWithCollect()
-
-        fixI()
-        data.currentCollectHouse       = ""
-        data.silentWindowOpen          = false
-        data.showHouseControlWindow[0] = restoreHouseControl
-        data.notifyWindow.show[0]      = false
-        return true
-    end
 
     function self.tickTriggers(now)
         for _, trig in ipairs(triggers) do
@@ -5668,7 +5706,11 @@ if not cfg.useSimpleTopUp then
                     sampSendChat("/phone")
                     sendcef('launchedApp|24')
                     sampSendChat("/phone")
-                    sendResponse(dialogIdTable.phoneBankMenuId, 1, 10, "")
+                    -- FIX: пункт "Пополнить счёт за электроэнергию" в меню банка телефона —
+                    -- listitem=9 (10-й пункт, нумерация с 0), подтверждено логом ручного
+                    -- клика игрока. Было захардкожено 10 — попадали не туда, и авто-
+                    -- пополнение молча не срабатывало.
+                    sendResponse(dialogIdTable.phoneBankMenuId, 1, 9, "")
                     wait(500)
 
 
@@ -5861,7 +5903,11 @@ if not cfg.useSimpleTopUp then
                 sampSendChat("/phone")
                 wait(500)
 
-                sendResponse(dialogIdTable.phoneBankMenuId, 1, 10, "")
+                -- FIX: пункт "Пополнить счёт за электроэнергию" в меню банка телефона —
+                -- listitem=9 (10-й пункт, нумерация с 0), подтверждено логом ручного
+                -- клика игрока. Было захардкожено 10 — попадали не туда, и авто-
+                -- пополнение молча не срабатывало.
+                sendResponse(dialogIdTable.phoneBankMenuId, 1, 9, "")
                 wait(500)
 
                 for i, house in ipairs(housesToTopUp) do
