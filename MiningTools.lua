@@ -1,7 +1,7 @@
 script_name('Mining Tools')
 script_author('bounteiro (t.me/b0unteiro)')
-script_version('6.7.8')
-script_version_number(9)
+script_version('6.7.9')
+script_version_number(10)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
 local sampfuncs = require("sampfuncs")
@@ -701,6 +701,7 @@ local data = {
     currentFlashminerHouseAt     = 0,
     pendingHouseNumber     = nil,
     pendingHouseAt         = 0,
+    lastStatusUpdatedHouse = nil, -- № дома, для которого только что реально отработал updateHouseStatus
     scrollToSelection      = false,
     dialogData             = {
         flashminer = {},
@@ -927,6 +928,31 @@ function isOwnScriptDialogId(id)
         or id == dialogIdTable.coolantDialogId
         or id == dialogIdTable.videoCardSt
         or id == dialogIdTable.houseFlashMinerDialogId
+end
+
+-- FIX: раньше многие места скрипта слали sendResponse(dialogIdTable.X, ...)
+-- "вслепую" сразу после действия, которое ДОЛЖНО было открыть диалог X —
+-- не проверяя, что диалог реально открылся и что его ID совпадает с тем,
+-- что записан в конфиге. Если сервер меняет ID диалога (обновление,
+-- переиндексация) — такой клик просто улетает в никуда и скрипт зависает
+-- в ожидании ответа, который никогда не придёт.
+--
+-- Эта функция вместо этого ЖДЁТ, пока диалог реально появится на экране
+-- (sampIsDialogActive), забирает его АКТУАЛЬНЫЙ id через
+-- sampGetCurrentDialogId() и кликает уже по нему. Так клик всегда попадает
+-- в тот диалог, что реально сейчас открыт, а не в то число, что записано
+-- в dialogIdTable. fallbackId используется только если за timeoutMs вообще
+-- ничего не открылось (на всякий случай, чтобы не потерять клик совсем).
+function sendToOpenedDialog(sendResponse, fallbackId, button, listitem, input, timeoutMs)
+    local waited = 0
+    timeoutMs = timeoutMs or 3000
+    while not sampIsDialogActive() and waited < timeoutMs and not data.stopAction do
+        wait(50)
+        waited = waited + 50
+    end
+    local realId = sampIsDialogActive() and sampGetCurrentDialogId() or fallbackId
+    sendResponse(realId, button, listitem, input)
+    return realId
 end
 
 -- Ждём, пока игрок сам закроет своё окно (мы не трогаем его силой).
@@ -1925,18 +1951,39 @@ local taxTool = (function()
         capturedAmount = 0,
         confirmed      = false,
         nothingToPay   = false,
+        lastDialogId   = nil, -- реальный ID диалога "Оплата всех налогов", пойманный из onShowDialog
+        dialogSeen     = false,
     }
 
     function self.handleShowDialog(dialogId, style, title, button1, button2, text, placeholder)
-        if (title or ''):find("Оплата всех налогов")
-            and (text or ''):find("нет налогов")
-            and data.taskTypeNow == 'autoPayTaxes' then
-            state.confirmed = true
-            state.nothingToPay = true
-            sampSendDialogResponse(dialogId, 1, 0, "")
-            return true
+        if (title or ''):find("Оплата всех налогов") then
+            -- FIX: ID этого диалога сервер может менять (обновления/переиндексация).
+            -- Ловим реальный ID из самого события показа диалога вместо того,
+            -- чтобы полагаться на захардкоженный dialogIdTable.payAllTaxesDialogId.
+            state.lastDialogId = dialogId
+            state.dialogSeen = true
+
+            if (text or ''):find("нет налогов")
+                and data.taskTypeNow == 'autoPayTaxes' then
+                state.confirmed = true
+                state.nothingToPay = true
+                sampSendDialogResponse(dialogId, 1, 0, "")
+                return true
+            end
         end
         return false
+    end
+
+    -- Ждёт, пока onShowDialog поймает реальный ID диалога оплаты налогов.
+    -- Возвращает пойманный ID или nil, если диалог за timeoutMs не появился.
+    function self.waitForDialogId(timeoutMs)
+        local waited = 0
+        timeoutMs = timeoutMs or 3000
+        while not state.dialogSeen and waited < timeoutMs and not data.stopAction do
+            wait(50)
+            waited = waited + 50
+        end
+        return state.lastDialogId
     end
 
     function self.handleServerMessage(color, text)
@@ -1979,6 +2026,8 @@ local taxTool = (function()
         state.capturedAmount = 0
         state.confirmed = false
         state.nothingToPay = false
+        state.lastDialogId = nil
+        state.dialogSeen = false
     end
 
     function self.getCapturedAmount() return state.capturedAmount end
@@ -4885,6 +4934,15 @@ function updateHouseStatus(houseNumber, houseData)
             status.status = "good"
         end
     end
+
+    -- FIX: используется задачами updateStatuses/scanBasements как точный
+    -- сигнал "статус ИМЕННО этого дома реально обновился". Раньше эти задачи
+    -- ориентировались на #data.dialogData.videocards > 0, но это ложноположительный
+    -- сигнал: карты могли распарситься, а вот houseNum для них — не
+    -- определиться (resolveHouseNumberForCardDialog не сработал), и тогда
+    -- updateHouseStatus для НУЖНОГО дома вообще не вызывался, а задача уже
+    -- думала, что всё ок, и ехала дальше — дом так и оставался "Не проверено".
+    data.lastStatusUpdatedHouse = tonumber(houseNumber)
 end
 
 function resetIncomeRates()
@@ -5520,21 +5578,51 @@ function buildTaskTable(taskType, ...)
 
                 for i, house in ipairs(housesToProcess) do
                     if data.stopAction then break end
+                    local houseNum = tonumber(house.house_number)
                     data.dialogData.videocards = {}
+                    data.houseHasNoBasement = false
+                    data.lastStatusUpdatedHouse = nil
 
-                    -- FIX: раньше start_time для smart_wait брался ОДИН РАЗ до
-                    -- начала цикла по всем домам. Из-за этого уже со 2-го дома
-                    -- "прошедшее время" считалось от начала всей задачи, а не
-                    -- от выбора текущего дома, remaining_time_ms уходил в минус
-                    -- и smart_wait превращался в wait(0) — диалог закрывался
-                    -- раньше, чем приходил ответ сервера со списком видеокарт.
-                    -- Из-за этого houseNum/updateHouseStatus не успевали
-                    -- отработать, и дом навсегда оставался "Не проверено"
-                    -- (серым), сколько бы раз ни запускалось обновление.
-                    -- Теперь время отсчитывается заново для каждого дома.
-                    local start_time = monotonicSeconds()
+                    -- FIX: раньше здесь был фиксированный smart_wait(300, start_time) —
+                    -- диалог закрывался ровно через 300мс независимо от того, успел
+                    -- ли сервер реально прислать список видеокарт. При лаге сервера
+                    -- (что не редкость при обходе десятков домов подряд без пауз)
+                    -- ответ приходил ПОСЛЕ закрытия диалога, updateHouseStatus не
+                    -- успевал сработать, и дом навсегда оставался "Не проверено".
+                    --
+                    -- FIX2: проверяли успех по #data.dialogData.videocards > 0 — но это
+                    -- ложноположительный сигнал: карты могли распарситься, а вот
+                    -- houseNum для НИХ иногда не определялся (resolveHouseNumberForCardDialog
+                    -- промахивался), и тогда updateHouseStatus вызывался не для того
+                    -- дома (или не вызывался вовсе) — задача считала себя успешной
+                    -- и ехала дальше, а дом оставался "Не проверено". Теперь ждём
+                    -- ТОЧНЫЙ сигнал: data.lastStatusUpdatedHouse == houseNum,
+                    -- который updateHouseStatus проставляет только когда реально
+                    -- обновил статус именно этого дома.
                     dialogActions.selectHouse(sendResponse, house.index - 1)
-                    smart_wait(300, start_time)
+
+                    local t = 0
+                    while data.lastStatusUpdatedHouse ~= houseNum and not data.houseHasNoBasement and t < 2000 do
+                        wait(50)
+                        t = t + 50
+                    end
+
+                    if data.lastStatusUpdatedHouse ~= houseNum and not data.houseHasNoBasement then
+                        wait(150)
+                        dialogActions.selectHouse(sendResponse, house.index - 1)
+                        t = 0
+                        while data.lastStatusUpdatedHouse ~= houseNum and not data.houseHasNoBasement and t < 2000 do
+                            wait(50)
+                            t = t + 50
+                        end
+                    end
+
+                    if data.lastStatusUpdatedHouse ~= houseNum and not data.houseHasNoBasement then
+                        utils.debugChat(string.format(
+                            "[STATUS] Дом №%d: статус не обновился после 2 попыток (сервер не ответил или не удалось определить № дома)",
+                            house.house_number))
+                    end
+
                     dialogActions.closeDialog(sendResponse)
 
                     progressTracker.increment()
@@ -5567,14 +5655,36 @@ function buildTaskTable(taskType, ...)
                 for i, house in ipairs(houses) do
                     if data.stopAction then break end
                     data.houseHasNoBasement = false
+                    data.dialogData.videocards = {}
 
+                    -- FIX: раньше здесь был фиксированный wait(0.5с), и после него
+                    -- cfg.basementScanned[house] = true проставлялось БЕЗУСЛОВНО —
+                    -- даже если клик промазал или сервер лагнул и вообще ничего не
+                    -- пришло (ни список видеокарт, ни "нет подвала"). Такой дом
+                    -- считался "просканированным" навсегда, хотя по факту его
+                    -- никто не проверил, и он выпадал из очереди на пересканирование.
+                    -- Теперь реально ждём ответ сервера (список карт либо
+                    -- "нет подвала"), при неудаче делаем один повторный клик,
+                    -- и basementScanned выставляем только если ответ реально пришёл.
                     dialogActions.selectHouse(sendResponse, house.index - 1)
 
-                    local start_time = monotonicSeconds()
-                    while monotonicSeconds() - start_time < 0.5 do
-                        wait(100)
-                        if data.houseHasNoBasement then break end
+                    local t = 0
+                    while #data.dialogData.videocards == 0 and not data.houseHasNoBasement and t < 2000 do
+                        wait(50)
+                        t = t + 50
                     end
+
+                    if #data.dialogData.videocards == 0 and not data.houseHasNoBasement then
+                        wait(150)
+                        dialogActions.selectHouse(sendResponse, house.index - 1)
+                        t = 0
+                        while #data.dialogData.videocards == 0 and not data.houseHasNoBasement and t < 2000 do
+                            wait(50)
+                            t = t + 50
+                        end
+                    end
+
+                    local scanConfirmed = data.houseHasNoBasement or #data.dialogData.videocards > 0
 
                     if data.houseHasNoBasement then
                         cfg.housesWithoutBasement[tostring(house.house_number)] = true
@@ -5583,7 +5693,14 @@ function buildTaskTable(taskType, ...)
                     else
                         dialogActions.closeDialog(sendResponse)
                     end
-                    cfg.basementScanned[tostring(house.house_number)] = true
+
+                    if scanConfirmed then
+                        cfg.basementScanned[tostring(house.house_number)] = true
+                    else
+                        utils.debugChat(string.format(
+                            "[SCAN] Дом №%d: сервер не ответил после 2 попыток — подвал не проверен, попробуем в следующий раз",
+                            house.house_number))
+                    end
                     progressTracker.increment()
                 end
                 save()
@@ -5710,9 +5827,10 @@ if not cfg.useSimpleTopUp then
                     -- listitem=9 (10-й пункт, нумерация с 0), подтверждено логом ручного
                     -- клика игрока. Было захардкожено 10 — попадали не туда, и авто-
                     -- пополнение молча не срабатывало.
-                    sendResponse(dialogIdTable.phoneBankMenuId, 1, 9, "")
-                    wait(500)
-
+                    -- FIX2: раньше был fixed wait(500) + слепой клик по phoneBankMenuId.
+                    -- Теперь ждём реального открытия меню и кликаем по актуальному ID.
+                    sendToOpenedDialog(sendResponse, dialogIdTable.phoneBankMenuId, 1, 9, "", 3000)
+                    wait(300)
 
                     for i, house in ipairs(summary.houses_to_top_up) do
                         if data.stopAction or not data.working then break end
@@ -5743,8 +5861,13 @@ if not cfg.useSimpleTopUp then
 
                             data.topUpLastFailed = false
                             data.topUpLastSucceeded = false
-                            sendResponse(dialogIdTable.houseListBankId, 1, house.index - 1, "")
-                            sendResponse(dialogIdTable.topUpBalanceDialogId, 1, 0, tostring(amount_this_transaction))
+                            -- FIX: раньше оба клика (выбор дома → ввод суммы) слались
+                            -- подряд без паузы и без проверки, что диалог выбора дома
+                            -- реально открылся — по захардкоженным ID. Теперь ждём
+                            -- открытия диалога выбора дома, кликаем по актуальному ID,
+                            -- затем так же ждём диалог ввода суммы и кликаем по нему.
+                            sendToOpenedDialog(sendResponse, dialogIdTable.houseListBankId, 1, house.index - 1, "", 3000)
+                            sendToOpenedDialog(sendResponse, dialogIdTable.topUpBalanceDialogId, 1, 0, tostring(amount_this_transaction), 3000)
 
                             local confirmWait = 0
                             while confirmWait < 5000 do
@@ -5831,12 +5954,22 @@ if not cfg.useSimpleTopUp then
             sampSendChat("/phone")
             sendcef('launchedApp|24')
             sampSendChat("/phone")
-            wait(500)
 
-            sendResponse(dialogIdTable.phoneBankMenuId, 1, 4, "")
+            -- FIX: раньше тут был просто wait(500), а затем слепой клик по
+            -- захардкоженному phoneBankMenuId. Теперь ждём, пока меню банка
+            -- реально откроется, и кликаем по актуальному ID.
+            sendToOpenedDialog(sendResponse, dialogIdTable.phoneBankMenuId, 1, 4, "", 3000)
             wait(300)
 
-            sendResponse(dialogIdTable.payAllTaxesDialogId, 1, 0, "")
+            -- FIX: ID диалога "Оплата всех налогов" мог смениться на сервере.
+            -- Ждём, пока onShowDialog реально его поймает (taxTool.waitForDialogId),
+            -- и жмём подтверждение по актуальному ID. Если за 3с диалог не
+            -- поймали (например, taxTool уже сам всё подтвердил в ветке
+            -- "нет налогов") — используем захардкоженный ID как fallback.
+            local payDialogId = taxTool.waitForDialogId(3000)
+            if not taxTool.isConfirmed() then
+                sendResponse(payDialogId or dialogIdTable.payAllTaxesDialogId, 1, 0, "")
+            end
 
             local confirmWait = 0
             while confirmWait < 10000 and not taxTool.isConfirmed() and not data.stopAction do
@@ -5901,14 +6034,15 @@ if not cfg.useSimpleTopUp then
                 sampSendChat("/phone")
                 sendcef('launchedApp|24')
                 sampSendChat("/phone")
-                wait(500)
 
                 -- FIX: пункт "Пополнить счёт за электроэнергию" в меню банка телефона —
                 -- listitem=9 (10-й пункт, нумерация с 0), подтверждено логом ручного
                 -- клика игрока. Было захардкожено 10 — попадали не туда, и авто-
                 -- пополнение молча не срабатывало.
-                sendResponse(dialogIdTable.phoneBankMenuId, 1, 9, "")
-                wait(500)
+                -- FIX2: раньше был fixed wait(500) + слепой клик по phoneBankMenuId.
+                -- Теперь ждём реального открытия меню и кликаем по актуальному ID.
+                sendToOpenedDialog(sendResponse, dialogIdTable.phoneBankMenuId, 1, 9, "", 3000)
+                wait(300)
 
                 for i, house in ipairs(housesToTopUp) do
                     if data.stopAction then break end
@@ -5941,8 +6075,12 @@ if not cfg.useSimpleTopUp then
 
                         data.topUpLastFailed = false
                         data.topUpLastSucceeded = false
-                        sendResponse(dialogIdTable.houseListBankId, 1, house.index - 1, "")
-                        sendResponse(dialogIdTable.topUpBalanceDialogId, 1, 0, tostring(amount))
+                        -- FIX: раньше оба клика (выбор дома → ввод суммы) слались
+                        -- подряд без паузы и без проверки, что диалог реально открылся —
+                        -- по захардкоженным ID. Теперь ждём открытия каждого диалога
+                        -- и кликаем по актуальному ID.
+                        sendToOpenedDialog(sendResponse, dialogIdTable.houseListBankId, 1, house.index - 1, "", 3000)
+                        sendToOpenedDialog(sendResponse, dialogIdTable.topUpBalanceDialogId, 1, 0, tostring(amount), 3000)
 
                         -- Count the transaction only after an explicit server confirmation.
                         local confirmWait = 0
