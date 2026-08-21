@@ -1,6 +1,6 @@
 script_name('Mining Tools')
 script_author('bounteiro (t.me/b0unteiro)')
-script_version('6.8.0')
+script_version('6.8.1')
 script_version_number(8)
 script_description('Скрипт для упрощения майнинга на сервере.')
 
@@ -152,8 +152,7 @@ local dialogIdTable          = {
         phoneBankMenuId = 6565,          -- ID главного меню банка в телефоне
         payAllTaxesDialogId = 15252,     -- ID диалога подтверждения оплаты всех налогов
         houseListBankId = 7238,          -- ID диалога выбора дома для пополнения (тот же что и houseDialogId)
-        topUpBalanceDialogId = 27036,    -- ID диалога ввода суммы пополнения
-
+        topUpBalanceDialogId = 27037,    -- ID диалога ввода суммы пополнения
     },
     rodina = {
         videoCardSt = 25244,           -- ID диалога полки
@@ -361,6 +360,41 @@ local function sanitizeForPath(s)
     return s
 end
 
+-- Сервер иногда дописывает в конец своего названия маркетинговые приписки
+-- вида "| X4 Payday!!" (акции, множители и т.п.). Формат имени всегда
+-- "Arizona <режим> | <Город>[ | что-то ещё]" — берём только первые два
+-- сегмента, чтобы такие приписки не считались сменой сервера (иначе
+-- скрипт решает, что это новый профиль, и создаёт его заново).
+local function normalizeServerName(sn)
+    if not sn or sn == '' then return sn end
+    local prefix, city = sn:match("^%s*(Arizona [^|]+)|%s*([^|]+)")
+    if prefix and city then
+        city = city:match("^%s*(.-)%s*$")
+        return prefix:match("^%s*(.-)%s*$") .. " | " .. city
+    end
+    return sn
+end
+
+-- Отдельно сервер иногда меняет и сам текст режима на сокращённый
+-- (например, "Arizona RP" вместо "Arizona Role Play") — это не связано
+-- с промо-приписками, но по той же причине ломает ключ профиля и создаёт
+-- новый пустой профиль вместо старого. Известные варианты приводим к
+-- одному каноничному виду ТОЛЬКО для ключа профиля (на сообщение в чат
+-- это не влияет — там показываем реальное текущее имя сервера).
+local PREFIX_ALIASES = {
+    ["arizona rp"] = "Arizona Role Play",
+}
+local function normalizeServerNameForProfile(sn)
+    local normalized = normalizeServerName(sn)
+    if not normalized or normalized == '' then return normalized end
+    local prefix, city = normalized:match("^(.-) | (.+)$")
+    if prefix and city then
+        local alias = PREFIX_ALIASES[prefix:lower()]
+        if alias then return alias .. " | " .. city end
+    end
+    return normalized
+end
+
 local function getProfilesDir()
     return getWorkingDirectory() .. '/config/' .. thisScript().name .. '/profiles/'
 end
@@ -399,6 +433,75 @@ end
 
 local function getProfileLogsPath(key)
     return getProfilesDir() .. key .. '/logs.json'
+end
+
+-- Пока действовал баг со сменой ключа профиля из-за приписок сервера
+-- (например, "| X4 Payday!!"), при каждом появлении/исчезновении такой
+-- приписки создавался НОВЫЙ пустой профиль под новым ключом, а реальные
+-- накопленные данные (дома, снапшоты) оставались лежать в старом.
+-- Если по свежевычисленному (уже нормализованному) ключу файла ещё нет —
+-- ищем среди уже существующих профилей с тем же ником такой, где реально
+-- есть данные, и копируем его как стартовый, чтобы ничего не потерялось.
+local function migrateProfileIfEmpty(newKey, nick)
+    local newPath = getProfileConfigPath(newKey)
+    if doesFileExist(newPath) then return end -- по новому ключу уже есть данные
+
+    local okLfs, lfs = pcall(require, 'lfs')
+    if not okLfs or not lfs or not lfs.dir then return end
+
+    local profilesDir = getProfilesDir()
+    if not doesDirectoryExist(profilesDir) then return end
+
+    local nickSuffix = '__' .. sanitizeForPath(nick)
+    local bestPath, bestMTime, bestScore = nil, -1, -1
+
+    local okIter, iter = pcall(lfs.dir, profilesDir)
+    if not okIter then return end
+
+    for entry in iter do
+        if entry ~= '.' and entry ~= '..' and entry ~= newKey
+            and entry:sub(-#nickSuffix) == nickSuffix then
+            local candidatePath = profilesDir .. entry .. '/config.json'
+            if doesFileExist(candidatePath) then
+                local f = io.open(candidatePath, 'r')
+                if f then
+                    local content = f:read('*all')
+                    f:close()
+                    local ok, parsed = pcall(json.decode, content)
+                    if ok and type(parsed) == 'table' then
+                        local score = 0
+                        if type(parsed.cardSnapshots) == 'table' then
+                            for _ in pairs(parsed.cardSnapshots) do score = score + 1 end
+                        end
+                        local mtime = 0
+                        local okAttr, attr = pcall(lfs.attributes, candidatePath)
+                        if okAttr and type(attr) == 'table' then
+                            mtime = attr.modification or 0
+                        end
+                        if score > 0 and (score > bestScore
+                            or (score == bestScore and mtime > bestMTime)) then
+                            bestPath, bestMTime, bestScore = candidatePath, mtime, score
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if bestPath then
+        local src = io.open(bestPath, 'r')
+        if src then
+            local content = src:read('*all')
+            src:close()
+            local dir = profilesDir .. newKey
+            if not doesDirectoryExist(dir) then createDirectory(dir) end
+            local dst = io.open(newPath, 'w')
+            if dst then
+                dst:write(content)
+                dst:close()
+            end
+        end
+    end
 end
 
 -- Ждём, пока станет известен ник локального игрока (сразу после коннекта его может
@@ -983,17 +1086,43 @@ end
 -- нашлись — например, сервер переименовал пункт), используется старый
 -- жёстко заданный fallbackIndex, но в чат/лог выводится предупреждение,
 -- чтобы это было видно и не выглядело как "тихо не сработало".
-function sendMenuActionByText(sendResponse, dialogIdToWaitFor, patterns, fallbackIndex, label, maxWaitMs)
+function sendMenuActionByText(sendResponse, dialogIdToWaitFor, patterns, fallbackIndex, label, maxWaitMs, sinceMonotonic)
     maxWaitMs = maxWaitMs or 3000
+    -- FIX: во время "тихих" массовых операций (isMassAction) диалог банка
+    -- намеренно подавляется в onShowDialog через return false, чтобы не
+    -- мешать игроку на экране. Но после подавления sampIsDialogActive()/
+    -- sampGetCurrentDialogId() ПЕРЕСТАЮТ считать этот диалог активным —
+    -- хотя его текст УЖЕ был успешно распознан в data.dialogData.bankMenuItems
+    -- парсером в onShowDialog (тот код выполняется до подавления). Из-за
+    -- этого проверка "диалог активен?" ниже всегда была false в тихом
+    -- режиме, items считался пустым, и скрипт вечно уходил в fallback по
+    -- номеру строки — даже когда меню было распознано верно. Поэтому
+    -- вместо "виден ли диалог сейчас" проверяем "было ли меню банка
+    -- распознано только что" (по времени захвата), что не зависит от
+    -- подавления отображения.
+    --
+    -- FIX 2: вызывающий код обычно делает "/phone" -> wait(500) -> сюда.
+    -- Диалог банка нередко успевает открыться и быть распознан ещё ВНУТРИ
+    -- этого wait(500), т.е. ДО того, как мы вообще вошли в эту функцию.
+    -- Если засекать waitStart только здесь, такой (уже свежий и верный!)
+    -- захват оказывается "старее" waitStart и отбрасывается как нефреш —
+    -- отсюда ложное "не найдено по тексту" при каждом вызове. Поэтому
+    -- вызывающая сторона может передать sinceMonotonic — момент, снятый
+    -- ДО отправки "/phone", и именно от него отсчитывается свежесть.
+    local waitStart = sinceMonotonic or monotonicSeconds()
     local waited = 0
     while waited < maxWaitMs do
-        if sampIsDialogActive() and sampGetCurrentDialogId() == dialogIdToWaitFor then break end
+        local dialogVisible = sampIsDialogActive() and sampGetCurrentDialogId() == dialogIdToWaitFor
+        local dialogCapturedFresh = data.dialogData.bankMenuCapturedAt >= waitStart
+        if dialogVisible or dialogCapturedFresh then break end
         if data.stopAction then return nil end
         wait(50)
         waited = waited + 50
     end
 
-    local items = (sampIsDialogActive() and sampGetCurrentDialogId() == dialogIdToWaitFor)
+    local dialogVisible = sampIsDialogActive() and sampGetCurrentDialogId() == dialogIdToWaitFor
+    local dialogCapturedFresh = data.dialogData.bankMenuCapturedAt >= waitStart
+    local items = (dialogVisible or dialogCapturedFresh)
         and data.dialogData.bankMenuItems or nil
     local resolvedIndex, foundByText = findMenuItemIndexByText(items, patterns, fallbackIndex)
 
@@ -1005,6 +1134,18 @@ function sendMenuActionByText(sendResponse, dialogIdToWaitFor, patterns, fallbac
             "{FFE133}Не удалось распознать пункт меню \"%s\" по тексту — использую запасной номер строки (%d). "
                 .. "Если оплата снова не пройдёт, вероятно сервер изменил меню банка.",
             label, fallbackIndex))
+        -- FIX: раньше при неудачном поиске было видно только "не нашлось", но
+        -- не было видно, ЧТО реально прислал сервер — приходилось гадать.
+        -- Теперь сразу пишем в дебаг-лог все распознанные пункты меню, чтобы
+        -- по логу было видно точную формулировку и можно было поправить
+        -- шаблон поиска, не гадая вслепую.
+        if items and #items > 0 then
+            for _, item in ipairs(items) do
+                utils.debugChat(string.format("[BANK]   [%d] %s", item.index, item.clean))
+            end
+        else
+            utils.debugChat("[BANK]   (меню банка не было распознано на момент поиска — items пуст)")
+        end
     else
         utils.debugChat(string.format(
             "[BANK] Пункт меню \"%s\" найден по тексту на строке %d", label, resolvedIndex))
@@ -3314,12 +3455,13 @@ end
 -- (в этом случае дальнейший код в вызывающем месте выполнять не нужно).
 local function checkAndSwitchProfile(sn, nick)
     sn = sn or (isSampAvailable() and sampGetCurrentServerName())
+    sn = normalizeServerName(sn)
     if not sn or sn == '' or sn == 'SA-MP' then return false, false end
 
     nick = nick or waitForNickname(5000)
     if not nick or nick == '' then return false, false end
 
-    local profileKey = sanitizeForPath(sn) .. '__' .. sanitizeForPath(nick)
+    local profileKey = sanitizeForPath(normalizeServerNameForProfile(sn)) .. '__' .. sanitizeForPath(nick)
 
     utils.debugChat("{808080}[DEBUG] profileKey = {FFFFFF}" .. profileKey ..
         " {808080}(активный: {FFFFFF}" .. tostring(activeProfileKey) .. "{808080})")
@@ -3333,6 +3475,7 @@ local function checkAndSwitchProfile(sn, nick)
     -- перелёт между Arizona-серверами без рестарта игры). Переключаем
     -- указатель на нужный config.json и перезапускаем скрипт, чтобы все
     -- данные (дома, снапшоты, доходность) читались уже из правильного профиля.
+    migrateProfileIfEmpty(profileKey, nick)
     writePointer(profileKey)
     cfg.isReloaded = true
     save()
@@ -3483,6 +3626,7 @@ function main()
         if sn and (sn:find('Arizona') or sn:find('Rodina')) then break end
         wait(0)
     end
+    sn = normalizeServerName(sn)
     data.isRodina = not isArizonaServer()
     dialogIdTable = data.isRodina and dialogIdTable.rodina or dialogIdTable.arizona
 
@@ -4101,6 +4245,36 @@ end
         data.dialogData.bankMenuItems = parseDialogListItems(text)
         data.dialogData.bankMenuCapturedAt = monotonicSeconds()
         utils.debugChat("[BANK] Меню банка распознано, пунктов: " .. tostring(#data.dialogData.bankMenuItems))
+        -- FIX: чат прокручивается и теряет строки уже через несколько секунд —
+        -- поэтому не видно, как сервер реально называет пункты меню, и шаблоны
+        -- поиска приходится подбирать вслепую. Пишем распознанные пункты в
+        -- отдельный файл-лог (каждое открытие меню банка), чтобы можно было
+        -- посмотреть точные формулировки уже после теста.
+        if cfg.debug then
+            local logFile = io.open(getWorkingDirectory() .. "/config/Mining Tools/bank_menu_debug.log", "a")
+            if logFile then
+                logFile:write("========== " .. os.date("%Y-%m-%d %H:%M:%S") .. " ==========\n")
+                for _, item in ipairs(data.dialogData.bankMenuItems) do
+                    logFile:write(string.format("[%d] %s\n", item.index, item.clean))
+                end
+                logFile:write("========================================\n\n")
+                logFile:close()
+            end
+        end
+    end
+
+    -- FIX: сервер стал (иногда/всегда) показывать диалог "Баланс домашнего
+    -- счёта" сразу после ввода суммы пополнения, вместо старого сообщения в
+    -- чат "Вы пополнили счёт дома за ...". Раньше этот dialogId никак не
+    -- обрабатывался — окно просто зависало открытым, а data.topUpLastSucceeded
+    -- никогда не выставлялся, поэтому через 5 сек скрипт останавливался с
+    -- ошибкой "Сервер не подтвердил пополнение", хотя деньги уже пришли.
+    if dialogId == dialogIdTable.topUpConfirmDialogId and data.working then
+        utils.debugChat("[BANK] Диалог подтверждения пополнения (id=" .. tostring(dialogId)
+            .. ") получен, считаю операцию успешной и закрываю.")
+        data.topUpLastSucceeded = true
+        sampSendDialogResponse(dialogId, 0, 0, "")
+        return false
     end
     if title:find("Выберите полку") then
         local currentIndex = 0
@@ -5339,9 +5513,19 @@ function buildTaskTable(taskType, ...)
             createProtectedTask(function(sendResponse)
                 local actualHousesToProcess = {}
                 local unconfirmedHouses = {}
+                -- FIX (skip-cache staleness bug): кэш houseStatuses раньше
+                -- доверялся бессрочно (lastCheck > 0 без проверки давности).
+                -- Если у дома когда-либо был 0 BTC/ASC на момент проверки,
+                -- он пропускался ВО ВСЕХ последующих прогонах навсегда, даже
+                -- если майнинг с тех пор накопил крипту, потому что дом
+                -- больше никогда заново не открывался. Теперь кэш "нулевого"
+                -- баланса доверенный только SKIP_CACHE_TTL секунд, дальше
+                -- дом снова считается непроверенным и посещается.
+                local SKIP_CACHE_TTL = 300
+                local now0 = os.time()
                 for _, house in ipairs(housesToProcess) do
                     local status = data.houseStatuses[house.house_number]
-                    if status and status.lastCheck > 0 then
+                    if status and status.lastCheck > 0 and (now0 - status.lastCheck) < SKIP_CACHE_TTL then
                         local btc = (status.earnings and status.earnings.btc) or 0
                         local asc = (status.earnings and status.earnings.asc) or 0
                         local minThreshold = cfg.collectOnlyIfMin or 0
@@ -5363,7 +5547,7 @@ function buildTaskTable(taskType, ...)
                         house.house_number, i, #actualHousesToProcess))
 
                     local status = data.houseStatuses[house.house_number]
-                    if status and status.lastCheck > 0 then
+                    if status and status.lastCheck > 0 and (os.time() - status.lastCheck) < SKIP_CACHE_TTL then
                         local hasBtc = status.earnings and status.earnings.btc >= 1
                         local hasAsc = status.earnings and status.earnings.asc >= 1
                         if not hasBtc and not hasAsc then
@@ -5761,11 +5945,26 @@ if not cfg.useSimpleTopUp then
                     sampCloseCurrentDialogWithButton(0)
                 end
                 if #summary.houses_to_top_up > 0 and (cfg.fixTopUpEnabled or cfg.useSimpleTopUp) then
+                    -- FIX: засекаем момент ДО отправки "/phone", а не после
+                    -- следующего wait(500) — иначе если сервер пришлёт меню
+                    -- банка прямо во время этой паузы, его свежий захват
+                    -- будет ошибочно отброшен как "устаревший" (см. FIX 2
+                    -- в sendMenuActionByText).
+                    local menuWaitStart = monotonicSeconds()
                     sampSendChat("/phone")
                     sendcef('launchedApp|24')
                     sampSendChat("/phone")
+                    -- FIX: перед этим блоком мог только что закрыться другой диалог
+                    -- (sampCloseCurrentDialogWithButton выше по коду) — серверу нужно
+                    -- время открыть меню банка. Без этой паузы sendMenuActionByText
+                    -- начинал опрос до того, как диалог реально становился текущим,
+                    -- и всегда уходил в fallback по индексу (items пуст), даже когда
+                    -- меню было корректно распознано мгновением позже. Паттерн как в
+                    -- autoPayTaxes / autoTopUp: wait(500) СТРОГО перед вызовом.
+                    wait(500)
                     sendMenuActionByText(sendResponse, dialogIdTable.phoneBankMenuId,
-                        { "электричеств" }, 9, "Пополнить счёт на электричество")
+                        { "электричеств" }, 9, "Пополнить счёт на электричество",
+                        nil, menuWaitStart)
                     wait(500)
 
 
@@ -5812,6 +6011,12 @@ if not cfg.useSimpleTopUp then
                                 data.stopBySystem = true
                                 data.stopAction = true
                                 utils.addChat("{F78181}Сервер не подтвердил пополнение за 5 секунд. Операция остановлена.")
+                                -- FIX: если завис диалог (например, тот самый "Баланс домашнего
+                                -- счёта", который не удалось поймать выше) — закрываем его сами,
+                                -- иначе игрок остаётся с открытым окном и сломанным управлением.
+                                if sampIsDialogActive() then
+                                    sampCloseCurrentDialogWithButton(0)
+                                end
                             end
                             if data.topUpLastFailed or data.stopAction then
                                 break
@@ -5883,13 +6088,17 @@ if not cfg.useSimpleTopUp then
         createProtectedTask(function(sendResponse)
             taxTool.resetCapturedAmount()
 
+            -- FIX: см. комментарий у первого такого вызова выше по файлу —
+            -- время нужно засекать до "/phone", иначе гонка с wait(500).
+            local menuWaitStart = monotonicSeconds()
             sampSendChat("/phone")
             sendcef('launchedApp|24')
             sampSendChat("/phone")
             wait(500)
 
             sendMenuActionByText(sendResponse, dialogIdTable.phoneBankMenuId,
-                { "всех налог" }, 4, "Оплата всех налогов")
+                { "всех налог" }, 4, "Оплата всех налогов",
+                nil, menuWaitStart)
             wait(300)
 
             sendResponse(dialogIdTable.payAllTaxesDialogId, 1, 0, "")
@@ -5961,13 +6170,17 @@ if not cfg.useSimpleTopUp then
                 progressTracker.setTotal(#housesToTopUp)
 
                 -- Открываем телефон -> банк -> пополнение
+                -- FIX: см. комментарий у первого такого вызова выше по файлу —
+                -- время нужно засекать до "/phone", иначе гонка с wait(500).
+                local menuWaitStart = monotonicSeconds()
                 sampSendChat("/phone")
                 sendcef('launchedApp|24')
                 sampSendChat("/phone")
                 wait(500)
 
                 sendMenuActionByText(sendResponse, dialogIdTable.phoneBankMenuId,
-                    { "электричеств" }, 9, "Пополнить счёт на электричество")
+                    { "электричеств" }, 9, "Пополнить счёт на электричество",
+                    nil, menuWaitStart)
                 wait(500)
 
                 for i, house in ipairs(housesToTopUp) do
@@ -6016,6 +6229,9 @@ if not cfg.useSimpleTopUp then
                             data.stopBySystem = true
                             data.stopAction = true
                             utils.addChat("{F78181}Сервер не подтвердил пополнение за 5 секунд. Операция остановлена.")
+                            if sampIsDialogActive() then
+                                sampCloseCurrentDialogWithButton(0)
+                            end
                         end
                         if data.topUpLastFailed or data.stopAction then
                             break
